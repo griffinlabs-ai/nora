@@ -32,7 +32,7 @@ logger = get_logger(__name__)
 class TrainingConfig:
     def __init__(
         self,
-        per_device_batch_size: int = 16,
+        per_device_batch_size: int = 1,
         learning_rate: float = 5e-5,
         gradient_accumulation_steps: int = 1,
         num_warmup_steps: int = 1000,
@@ -67,24 +67,32 @@ class TrainingConfig:
         self.image_key = 'observation.images.head'
         self.action_key = 'action'
         self.task_key = 'task'
+        self.fps = 30
+        self.action_chunk_size = 50
 
 # --- 2. Data Loading and Preprocessing ---
 def load_and_prepare_dataset(config: TrainingConfig) -> MultiLeRobotDataset:
     """Loads and prepares the LeRobot dataset."""
+    delta_timestamps = [i / config.fps for i in range(config.action_chunk_size)]
     return MultiLeRobotDataset(
         [p.name for p in pathlib.Path(config.lerobot_dataset_root).glob("task_*")],
         root = config.lerobot_dataset_root,
+        delta_timestamps = {
+            "actions.joint.position": delta_timestamps,
+            "actions.effector.position": delta_timestamps,
+        }
     )
 
 def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
     image = batch[img_key]
+    prev_dim_sizes = batch['actions.joint.position'].shape[:2]
     action = torch.cat(
         [
-            batch['actions.joint.position'].view(-1, 2, 7),
-            1 - batch['actions.effector.position'].view(-1, 2, 1)
+            batch['actions.joint.position'].view(*prev_dim_sizes, 2, 7),
+            1 - batch['actions.effector.position'].view(*prev_dim_sizes, 2, 1)
         ],
         dim = -1
-    ).view(-1, 16)
+    ).view(*prev_dim_sizes, 16)
     batch = {k:v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.')}
     batch[img_key] = image
     batch['action'] = action
@@ -150,7 +158,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
         action = transition['action']
         lang = transition['complementary_data']['task']
-        fast_tokens = self.fast_tokenizer(action.cpu().unsqueeze(1))
+        fast_tokens = self.fast_tokenizer(action.cpu())
         vlm_action = [map_fast_token_to_vlm_action(ft) for ft in fast_tokens]
 
         messages = [
