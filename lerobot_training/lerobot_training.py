@@ -83,6 +83,12 @@ def load_and_prepare_dataset(config: TrainingConfig) -> MultiLeRobotDataset:
     )
 
 def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
+    """
+    Convert from raw dataset batch format to format that is ready to be converted to `EnvTransition`.
+    Merges `actions.joint.position` and `actions.effector.position` into `action`, discarding other actions.
+
+    Also discards all `observation.*` except the one matching `img_key`.
+    """
     image = batch[img_key]
     prev_dim_sizes = batch['actions.joint.position'].shape[:2]
     action = torch.cat(
