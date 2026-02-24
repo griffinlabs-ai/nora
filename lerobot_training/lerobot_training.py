@@ -1,18 +1,17 @@
 
 import os
 import logging
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Any, Optional
 from dataclasses import dataclass
 import pathlib
 
 import torch
-from torch.utils.data import Dataset, DataLoader, default_collate
+from torch.utils.data import DataLoader, default_collate
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
-from transformers import AutoProcessor, PreTrainedTokenizerBase, Qwen2_5_VLForConditionalGeneration
-from transformers import SchedulerType, get_scheduler
+from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
@@ -113,7 +112,6 @@ def invert_gripper_action(action):
 
 def inverse_transform_gripper_action(action, binarized_input=True):
     """
-    
     Maps the gripper action  to the range [0, 1].
     Args:
         action (torch.Tensor): The action vector with the gripper action as the last dimension,
@@ -131,7 +129,6 @@ def inverse_transform_gripper_action(action, binarized_input=True):
         # Just map -1 to 0 and +1 to 1. Note that the previous line we have already flipped the sign.
         action[..., -1] = torch.where(action[..., -1] == -1, 0.0, 1.0)
     else:
-        
         action[..., -1] = (action[..., -1] + 1) / 2
 
     return action
@@ -280,7 +277,6 @@ def train(config: TrainingConfig):
     accelerator.dataloader_config.dispatch_batches = False
     logger.info(accelerator.state, main_process_only=False)
 
-    
     accelerator.init_trackers(config.wandb_project_name, config=config)
         #wandb.init(project=config.wandb_project_name)
 
@@ -290,7 +286,6 @@ def train(config: TrainingConfig):
         dataset = load_and_prepare_dataset(config)
         policy_preprocessor = make_policy_processor(config, dataset.stats)
 
-    
     train_dataloader = DataLoader(
         dataset,
         batch_size=config.per_device_batch_size,
@@ -332,7 +327,6 @@ def train(config: TrainingConfig):
 
     completed_steps = 0
     progress_bar = tqdm(range(completed_steps,max_train_steps), disable=not accelerator.is_local_main_process)
-    
 
     while completed_steps < max_train_steps:
         for batch in train_dataloader:
@@ -342,9 +336,6 @@ def train(config: TrainingConfig):
                 loss = outputs.loss
 
                 accelerator.backward(loss)
-
-                
-                    
 
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
@@ -356,7 +347,6 @@ def train(config: TrainingConfig):
                     lr_scheduler.step()
 
                     if completed_steps % config.logging_frequency == 0:
-                        
                         if accelerator.is_main_process:
                             total_norm = 0.0
                             for p in model.parameters():
@@ -365,7 +355,7 @@ def train(config: TrainingConfig):
 
                             total_norm = total_norm**0.5
                             lr = lr_scheduler.get_last_lr()[0]
-                            
+
                             logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
                             accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm":total_norm}, step=completed_steps)
                     #logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
@@ -373,7 +363,6 @@ def train(config: TrainingConfig):
 
             if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                 accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
-                
 
             if completed_steps >= max_train_steps:
                 break
@@ -382,7 +371,7 @@ def train(config: TrainingConfig):
     if accelerator.is_main_process:
         checkpoint_path = os.path.join(config.output_dir, f"steps_{completed_steps}")
         logger.info(f"Training finished. Final checkpoint saved at {checkpoint_path}")
-      
+
 
 def main():
     config = TrainingConfig()
