@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import PIL.Image
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration, GenerationConfig
+from transformers import AutoProcessor, Qwen3VLForConditionalGeneration, GenerationConfig
 from typing import Optional, Union, Dict, Any
 from qwen_vl_utils import process_vision_info
 from huggingface_hub import hf_hub_download
@@ -40,7 +40,7 @@ class Nora:
     # Define action token range and normalization bounds as class attributes
     # These are specific to the model's vocabulary and task
     _ACTION_TOKEN_MIN = 151665
-    _ACTION_TOKEN_MAX = 153712
+    _ACTION_TOKEN_MAX = 153712   #checked
 
 
     def __init__(
@@ -54,7 +54,7 @@ class Nora:
 
         Args:
             model_path (str): Hugging Face model ID or local path for the main
-                            Qwen 2.5 VL model and processor.
+                            Qwen 3 VL model and processor.
             device (Optional[str]): The device to use for inference (e.g., "cuda:0", "cpu").
                                      If None, automatically detects CUDA or falls back to CPU.
             torch_dtype (torch.dtype): The data type to use for the model.
@@ -85,8 +85,8 @@ class Nora:
             )
             # Ensure required attributes are set/exist
            
-            self.fast_tokenizer.action_dim = 7 # Set default if not in config
-            print("Setting action_dim  to 7.")
+            self.fast_tokenizer.action_dim = 16
+            print("Setting action_dim  to 16.")
            
             self.fast_tokenizer.time_horizon = 1 # Set default if not in config
             print("Setting time horizon to 1.")
@@ -109,7 +109,7 @@ class Nora:
         # --- Load Main Model ---
         try:
             print(f"Loading model from: {model_path}")
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                 model_path,
                 torch_dtype=torch_dtype,
             #    attn_implementation="flash_attention_2", # Comment out this line if there is an error with flash attention

@@ -10,7 +10,9 @@ from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from transformers import AutoProcessor, PreTrainedTokenizerBase, Qwen2_5_VLForConditionalGeneration
+from transformers import AutoProcessor, PreTrainedTokenizerBase
+# --- 1. Updated Qwen3 Model Import ---
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from transformers import SchedulerType, get_scheduler
 from datasets import RLDSDataset, RLDSBatchTransform
 from qwen_vl_utils import process_vision_info
@@ -25,11 +27,11 @@ logger = get_logger(__name__)
 class TrainingConfig:
     def __init__(
         self,
-        per_device_batch_size: int = 16,
+        per_device_batch_size: int = 16,   # 1
         learning_rate: float = 5e-5,
-        gradient_accumulation_steps: int = 2,
+        gradient_accumulation_steps: int = 2,   #1
         num_warmup_steps: int = 1000,
-        max_train_steps: int = 100000,
+        max_train_steps: int = 100000,    #60000
         output_dir: str = '/your_output',
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
@@ -41,6 +43,8 @@ class TrainingConfig:
         checkpoint_save_frequency: int = 20000,
         logging_frequency: int = 100,
         gradient_clipping: Optional[float] = None, # Add gradient clipping option
+        # --- 2. Add model_id for Qwen3 ---
+        model_id: str = "Qwen/Qwen3-VL-4B-Instruct",
     ):
         self.per_device_batch_size = per_device_batch_size
         self.learning_rate = learning_rate
@@ -48,8 +52,8 @@ class TrainingConfig:
         self.num_warmup_steps = num_warmup_steps
         self.max_train_steps = max_train_steps
         self.output_dir = output_dir
-        self.resume_from_checkpoint = resume_from_checkpoint ## This is used to continue a training by loadinng the optimizer states, model weights etc ... 
-        self.load_model_weights = load_model_weights ## This is the path to a pretrained model weights if you want to finetune the model.
+        self.resume_from_checkpoint = resume_from_checkpoint 
+        self.load_model_weights = load_model_weights 
         self.data_root_dir = data_root_dir
         self.data_mix = data_mix
         self.resize_resolution = resize_resolution
@@ -58,6 +62,7 @@ class TrainingConfig:
         self.checkpoint_save_frequency = checkpoint_save_frequency
         self.logging_frequency = logging_frequency
         self.gradient_clipping = gradient_clipping
+        self.model_id = model_id
 
 # --- 2. Data Loading and Preprocessing ---
 def load_and_prepare_dataset(config: TrainingConfig, processor: AutoProcessor, is_train: bool = True) -> RLDSDataset:
@@ -80,7 +85,7 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
 def process_example(example: Dict[str, Any], fast_tokenizer: AutoProcessor) -> Dict[str, Any]:
     """Processes a single example from the dataset."""
     pixel_values = example['image']
-    action = example['action']
+    action = example['action'] # Assuming action is already [14] or [chunk, 14]
     lang = example['lang']
     fast_tokens = fast_tokenizer(action)
     vlm_action = map_fast_token_to_vlm_action(fast_tokens[0])
@@ -89,6 +94,7 @@ def process_example(example: Dict[str, Any], fast_tokenizer: AutoProcessor) -> D
         {
             "role": "user",
             "content": [
+                # Removed hardcoded resizing to let Qwen3 handle visual patches natively
                 {"type": "image", "image": pixel_values},
                 {"type": "text", "text": lang},
             ],
@@ -116,11 +122,13 @@ def collate_fn(examples,processor,fast_tokenizer):
             padding=True,
             return_tensors="pt",
         )
+        # Assuming the FAST tokenizer maps actions to 0-2047
+        # These are the standard Qwen extended vocabulary IDs for actions
         action_token_min = 151665
         action_token_max = 153712
         labels = batch_input['input_ids'].clone()
-        # For each sequence in the batch, find the first occurrence of an action token.
         
+        # For each sequence in the batch, find the first occurrence of an action token.
         for i in range(labels.size(0)):
             seq = labels[i]
             # Create a mask for tokens within the action token range.
@@ -140,18 +148,33 @@ def collate_fn(examples,processor,fast_tokenizer):
         return batch_input
 
 # --- 3. Model Initialization ---
-def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> tuple[Qwen2_5_VLForConditionalGeneration, AutoProcessor]:
-    """Loads the model and processor."""
-    processor = AutoProcessor.from_pretrained('declare-lab/nora')
+def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> tuple[Qwen3VLForConditionalGeneration, AutoProcessor, AutoProcessor]:
+    """Loads the model and processor with Qwen3 adaptation."""
+    
+    # 1. Load the Qwen3 Processor
+    processor = AutoProcessor.from_pretrained(config.model_id)
     processor.tokenizer.padding_side = 'left'
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        'declare-lab/nora',
+    
+    # 2. Add action tokens to the Qwen3 tokenizer (assuming FAST maps 0-2047)
+    action_tokens = [f"<robot_action_{i}>" for i in range(2048)]
+    processor.tokenizer.add_tokens(action_tokens, special_tokens=True)
+    
+    # 3. Load Qwen3-VL Base Model
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        config.model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2" ## Disable flash attention it is not supported in some GPUs
+        attn_implementation="sdpa", # Changed from flash_attention_2 for broader compatibility
+        trust_remote_code=True
     )
+    
+    # 4. Resize Embeddings to accommodate the added action tokens
+    model.resize_token_embeddings(len(processor.tokenizer))
+    accelerator.print(f"Resized Qwen3 token embeddings to: {len(processor.tokenizer)}")
+    
+    # 5. Load the FAST Tokenizer (Keep exactly as requested)
     fast_tokenizer = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
-        )
+        "physical-intelligence/fast", trust_remote_code=True
+    )
 
     if config.load_model_weights: 
         tensors = {}
@@ -160,7 +183,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -
             for k in f.keys():
                 tensors[k] = f.get_tensor(k)
         model.load_state_dict(tensors, strict=False)
-        accelerator.print("Pretrained weights loaded.")
+        accelerator.print(f"Pretrained weights loaded from {config.load_model_weights}.")
 
     return model, processor, fast_tokenizer
 
@@ -217,10 +240,8 @@ def train(config: TrainingConfig):
         accelerator.load_state(config.resume_from_checkpoint)
         accelerator.print(f"Resumed from local checkpoint: {config.resume_from_checkpoint}")
 
-    # Training loop
-    # Right now we assume single node training. I did not test on multi node training.
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
-    logger.info("***** Running training *****")
+    logger.info("***** Running Qwen3 Training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num steps = {config.max_train_steps}")
     logger.info(f"  Instantaneous batch size per device = {config.per_device_batch_size}")
@@ -236,65 +257,60 @@ def train(config: TrainingConfig):
         for batch in train_dataloader:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
+                
+                # Directly unpack the batch generated by the processor
                 outputs = model(**batch)
                 loss = outputs.loss
                 total_loss += loss.detach().float()
                 accelerator.backward(loss)
 
-                if config.gradient_clipping is not None:
-                    accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
-
+                # Move sync logic outside the backward pass but inside accumulate
                 if accelerator.sync_gradients:
+                    if config.gradient_clipping is not None:
+                        accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+                    
                     progress_bar.update(1)
                     completed_steps += 1
+                    
+                    # Logging inside the sync block ensures it only logs valid steps
+                    if completed_steps % config.logging_frequency == 0:
+                        if accelerator.is_main_process:
+                            total_norm = 0.0
+                            for p in model.parameters():
+                                if p.grad is not None:
+                                    total_norm += p.grad.data.norm(2).item() ** 2
 
+                            total_norm = total_norm**0.5
+                            lr = lr_scheduler.get_last_lr()[0]
+                            logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}")
+                            
+                            wandb.log({
+                                "train_loss": loss.item(), 
+                                "learning_rate": lr,
+                                "grad_norm": total_norm
+                            }, step=completed_steps)
+
+                # Optimizer and scheduler step must be outside the sync block when using accumulate
                 optimizer.step()
                 lr_scheduler.step()
 
-            # Logging
-            if completed_steps % config.logging_frequency == 0:
-                
-                
-                if accelerator.is_main_process:
+            # Checkpointing (must be outside accumulate context)
+            if accelerator.sync_gradients:
+                if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
+                    accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
+                    if accelerator.is_main_process:
+                        summary_data = {"steps": completed_steps, "train_loss": total_loss.item()/config.checkpoint_save_frequency}
+                        with open(os.path.join(config.output_dir, "summary.jsonl"), "a") as f:
+                            f.write(json.dumps(summary_data) + "\n")
+                        logger.info(f"Checkpoint saved at step {completed_steps}")
+                        total_loss = 0.0
                     
-                    total_norm = 0.0
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            total_norm += p.grad.data.norm(2).item() ** 2
-
-                    total_norm = total_norm**0.5
-                    lr = lr_scheduler.get_last_lr()[0]
-                    logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}")
-                    lr = lr_scheduler.get_last_lr()[0]
-                    result = {
-                        "train_loss": loss.item(),
-                        "grad_norm": total_norm,
-                        "learning_rate": lr,
-                    }
-                    wandb.log({"train_loss": loss.item(), "learning_rate": lr}, step=completed_steps)
-                
-
-            # Checkpointing
-            if completed_steps% config.checkpoint_save_frequency == 0 and completed_steps > 0:
-                accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
-                if accelerator.is_main_process:
-                    
-                    summary_data = {"steps": completed_steps, "train_loss": total_loss/config.checkpoint_save_frequency}
-                    with open(os.path.join(config.output_dir, "summary.jsonl"), "a") as f:
-                        f.write(json.dumps(summary_data) + "\n")
-                    logger.info(f"Checkpoint saved at step {completed_steps}")
-                    total_loss = 0.0
-                    
-
-            
             if completed_steps >= max_train_steps:
                 break
-
 
     # Save final checkpoint
     accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
     if accelerator.is_main_process:
-        
         checkpoint_path = os.path.join(config.output_dir, f"steps_{completed_steps}")
         logger.info(f"Training finished. Final checkpoint saved at {checkpoint_path}")
         wandb.finish()
