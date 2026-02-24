@@ -40,7 +40,7 @@ class TrainingConfig:
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
         lerobot_dataset_repo_id: str | None = None,
-        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot/agibotworld/",
+        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_depth/agibotworld/",
         wandb_project_name: str = "Nora VLA with LeRobotDataset",
         checkpoint_save_frequency: int = 20000,
         logging_frequency: int = 100,
@@ -252,17 +252,12 @@ def make_policy_processor(
 
 
 # --- 3. Model Initialization ---
-def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> tuple[Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoProcessor]:
+def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> Qwen2_5_VLForConditionalGeneration:
     """Loads the model and processor."""
-    processor = AutoProcessor.from_pretrained('declare-lab/nora')
-    processor.tokenizer.padding_side = 'left'
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         'declare-lab/nora',
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2"
-    )
-    fast_tokenizer = AutoProcessor.from_pretrained(
-        "physical-intelligence/fast", trust_remote_code=True
     )
 
     if config.load_model_weights:
@@ -274,7 +269,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -
         model.load_state_dict(tensors, strict=False)
         accelerator.print("Pretrained weights loaded.")
 
-    return model, processor, fast_tokenizer
+    return model
 
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
@@ -286,7 +281,7 @@ def train(config: TrainingConfig):
     accelerator.init_trackers(config.wandb_project_name, config=config)
         #wandb.init(project=config.wandb_project_name)
 
-    model, processor, fast_tokenizer = load_model_and_processor(config, accelerator)
+    model = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
         dataset = load_and_prepare_dataset(config)
