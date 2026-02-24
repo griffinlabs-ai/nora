@@ -2,9 +2,11 @@
 import os
 import logging
 from typing import List, Dict, Any, Callable, Optional
+from dataclasses import dataclass
+import pathlib
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, default_collate
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -12,12 +14,9 @@ from accelerate.utils import set_seed
 from transformers import AutoProcessor, PreTrainedTokenizerBase, Qwen2_5_VLForConditionalGeneration
 from transformers import SchedulerType, get_scheduler
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-from lerobot.configs.types import  NormalizationMode, PolicyFeature
-from lerobot.policies.normalize import (
-    Normalize,
-    Unnormalize,
-)
+import lerobot.processor
+from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
+from lerobot.configs.types import  NormalizationMode, PipelineFeatureType
 from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
@@ -41,7 +40,8 @@ class TrainingConfig:
         output_dir: str = './nora_finetune_object',
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
-        lerobot_dataset_repo_id: str = "lerobot/libero_object_image",
+        lerobot_dataset_repo_id: str | None = None,
+        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot/agibotworld/",
         wandb_project_name: str = "Nora VLA with LeRobotDataset",
         checkpoint_save_frequency: int = 20000,
         logging_frequency: int = 100,
@@ -57,20 +57,38 @@ class TrainingConfig:
         self.resume_from_checkpoint = resume_from_checkpoint
         self.load_model_weights = load_model_weights
         self.lerobot_dataset_repo_id = lerobot_dataset_repo_id
+        self.lerobot_dataset_root = lerobot_dataset_root
         self.wandb_project_name = wandb_project_name
         self.checkpoint_save_frequency = checkpoint_save_frequency
         self.logging_frequency = logging_frequency
         self.gradient_clipping = gradient_clipping
         ## In Nora's pretraining, the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open. While some environments have -1 = open, +1 = close. Setting this to True will invert the gripper action(map -1 to 1, +1 to 0)
-        self.invert_grippler_action = invert_grippler_action 
-        self.image_key = 'observation.images.image'
+        self.invert_grippler_action = invert_grippler_action
+        self.image_key = 'observation.images.head'
         self.action_key = 'action'
         self.task_key = 'task'
 
 # --- 2. Data Loading and Preprocessing ---
-def load_and_prepare_dataset(config: TrainingConfig) -> LeRobotDataset:
+def load_and_prepare_dataset(config: TrainingConfig) -> MultiLeRobotDataset:
     """Loads and prepares the LeRobot dataset."""
-    return LeRobotDataset(config.lerobot_dataset_repo_id)
+    return MultiLeRobotDataset(
+        [p.name for p in pathlib.Path(config.lerobot_dataset_root).glob("task_*")],
+        root = config.lerobot_dataset_root,
+    )
+
+def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
+    image = batch[img_key]
+    action = torch.cat(
+        [
+            batch['actions.joint.position'].view(-1, 2, 7),
+            1 - batch['actions.effector.position'].view(-1, 2, 1)
+        ],
+        dim = -1
+    ).view(-1, 16)
+    batch = {k:v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.')}
+    batch[img_key] = image
+    batch['action'] = action
+    return batch
 
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
@@ -110,79 +128,117 @@ def inverse_transform_gripper_action(action, binarized_input=True):
 
     return action
 
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("nora_processor")
+class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
-def process_example(example: Dict[str, Any],
-                    fast_tokenizer: AutoProcessor,
-                    normalizer: Normalize,
-                    cfg,
-                    ) -> Dict[str, Any]:
-    """Processes a single example from the dataset."""
-    example = normalizer(example)
-    pixel_values = example[cfg.image_key]
-    pixel_values = torchvision.transforms.functional.to_pil_image(pixel_values)
+    config: TrainingConfig
 
-    if cfg.invert_grippler_action:
+    def __post_init__(self):
+        self.fast_tokenizer = AutoProcessor.from_pretrained(
+            "physical-intelligence/fast", trust_remote_code=True
+        )
+        self.transformer_processor = AutoProcessor.from_pretrained('declare-lab/nora')
+        self.transformer_processor.tokenizer.padding_side = 'left'
 
-        #example[cfg.action_key][...,-1] = torch.where(example[cfg.action_key][-1] == -1, 1.0, 0.0)
-        example[cfg.action_key] = inverse_transform_gripper_action(example[cfg.action_key].clone(),binarized_input=True)  
-    
+    def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
+        pixel_values = transition['observation'][self.config.image_key]
+        pixel_values = [
+            torchvision.transforms.functional.to_pil_image(pv)
+            for pv in pixel_values
+        ]
 
-    action = example[cfg.action_key].unsqueeze(0)
-    lang = example[cfg.task_key]
-    fast_tokens = fast_tokenizer(action)
-    vlm_action = map_fast_token_to_vlm_action(fast_tokens[0])
+        action = transition['action']
+        lang = transition['complementary_data']['task']
+        fast_tokens = self.fast_tokenizer(action.cpu().unsqueeze(1))
+        vlm_action = [map_fast_token_to_vlm_action(ft) for ft in fast_tokens]
 
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": pixel_values,
-                 "resized_height": 224,
-                "resized_width": 224,},
-                {"type": "text", "text": lang},
+        messages = [
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": pv,
+                        "resized_height": 224,
+                        "resized_width": 224,},
+                        {"type": "text", "text": l},
 
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {"type": "text", "text": vlm_action},
-            ],
-        },
-    ]
-    return messages
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": act},
+                    ],
+                }
+            ]
+            for pv, l, act in zip(pixel_values, lang, vlm_action)
+        ]
 
-def collate_fn(examples, processor, fast_tokenizer, normalizer,config):
-    messages = [process_example(example, fast_tokenizer, normalizer,config) for example in examples]
+        text = self.transformer_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
 
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=False
+        image_inputs, video_inputs = process_vision_info(messages)
+        batch_input = self.transformer_processor(
+            text=text,
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        action_token_min = 151665
+        action_token_max = 153712
+        labels = batch_input['input_ids'].clone()
+
+        for i in range(labels.size(0)):
+            seq = labels[i]
+            mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
+            nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
+            if nonzero_indices.numel() > 0:
+                first_action_index = nonzero_indices[0].item()
+                seq[:first_action_index] = -100
+            else:
+                seq[:] = -100
+
+        labels[labels == self.transformer_processor.tokenizer.pad_token_id] = -100
+        batch_input['labels'] = labels
+
+        return lerobot.processor.create_transition(complementary_data = batch_input)
+
+    def transform_features(self, features):
+        return {
+            PipelineFeatureType.ACTION: {},
+            PipelineFeatureType.OBSERVATION: {},
+        }
+
+def make_policy_processor(
+        config: TrainingConfig,
+        norm_stats: dict[str, dict[str, np.ndarray]],
+) -> lerobot.processor.PolicyProcessorPipeline:
+    # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
+    # so the stats would have to be transformed as well, and order reversed (e.g. p10 becomes p90)
+    norm_stats = {
+        "action": {
+            "min": np.append(np.insert(norm_stats['actions.joint.position']['min'], 7, 0), 0),
+            "max": np.append(np.insert(norm_stats['actions.joint.position']['max'], 7, 1), 1),
+        }
+    }
+
+    norm_map = {
+        'ACTION': NormalizationMode.MIN_MAX,
+    }
+
+    return lerobot.processor.PolicyProcessorPipeline(
+        steps = [
+            lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
+            NoraPolicyProcessorStep(config),
+        ],
+        to_transition=lambda batch:
+            lerobot.processor.converters.batch_to_transition(agibot_world_to_nora_instance(batch, config.image_key)),
+        to_output=lerobot.processor.converters.transition_to_batch,
     )
-    image_inputs, video_inputs = process_vision_info(messages)
-    batch_input = processor(
-        text=text,
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    action_token_min = 151665
-    action_token_max = 153712
-    labels = batch_input['input_ids'].clone()
 
-    for i in range(labels.size(0)):
-        seq = labels[i]
-        mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
-        nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
-        if nonzero_indices.numel() > 0:
-            first_action_index = nonzero_indices[0].item()
-            seq[:first_action_index] = -100
-        else:
-            seq[:] = -100
-    
-    labels[labels == processor.tokenizer.pad_token_id] = -100
-    batch_input['labels'] = labels
-    return batch_input
 
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> tuple[Qwen2_5_VLForConditionalGeneration, AutoProcessor, AutoProcessor]:
@@ -224,26 +280,13 @@ def train(config: TrainingConfig):
 
     with accelerator.main_process_first():
         dataset = load_and_prepare_dataset(config)
-        metadata = LeRobotDatasetMetadata(config.lerobot_dataset_repo_id)
-        stats = metadata.stats
-       
-        if stats['action']['min'][-1]>=0 and config.invert_grippler_action:
-            logger.warning("The dataset's action stats indicate that the gripper action is already in the range [0, 1].  You are training with invert_grippler_action = True. Inverting gripper action may not be necessary.")
-
-        features = {
-                    'action': PolicyFeature(shape=stats['action']['mean'].shape, type='action'),
-                }
-        norm_map = {
-            'action': NormalizationMode.MIN_MAX,
-        }
-        normalizer = Normalize(features, norm_map, stats)
-
+        policy_preprocessor = make_policy_processor(config, dataset.stats)
 
     
     train_dataloader = DataLoader(
         dataset,
         batch_size=config.per_device_batch_size,
-        collate_fn=lambda examples: collate_fn(examples, processor, fast_tokenizer, normalizer,config)
+        collate_fn=lambda examples: policy_preprocessor(default_collate(examples)),
     )
 
     optimizer = torch.optim.AdamW(
