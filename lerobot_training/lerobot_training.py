@@ -291,6 +291,7 @@ def train(config: TrainingConfig):
         dataset,
         batch_size=config.per_device_batch_size,
         collate_fn=lambda examples: policy_preprocessor(default_collate(examples)),
+        shuffle=True,
     )
 
     optimizer = torch.optim.AdamW(
