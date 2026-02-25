@@ -40,7 +40,7 @@ class TrainingConfig:
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
         lerobot_dataset_repo_id: str | None = None,
-        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_depth/agibotworld/",
+        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_head_only/agibotworld/",
         wandb_project_name: str = "Nora VLA with LeRobotDataset",
         checkpoint_save_frequency: int = 20000,
         logging_frequency: int = 100,
@@ -106,38 +106,6 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
-
-def invert_gripper_action(action):
-    """
-    Flips the sign of the gripper action (last dimension of action vector).
-    This is necessary for some environments where -1 = open, +1 = close, since
-    the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open.
-    """
-    action[..., -1] = action[..., -1] * -1.0
-    return action
-
-def inverse_transform_gripper_action(action, binarized_input=True):
-    """
-    Maps the gripper action  to the range [0, 1].
-    Args:
-        action (torch.Tensor): The action vector with the gripper action as the last dimension,
-                             which has been transformed by invert_gripper_action and then
-                             normalize_gripper_action.
-        binarized_input (bool): Whether the input to normalize_gripper_action was binarized.
-                                This affects the inverse transformation.
-
-    """
-
-    action[..., -1] = action[..., -1] * -1.0
-
-    if binarized_input:
-        # If the input was binarized, the values are -1 or +1.
-        # Just map -1 to 0 and +1 to 1. Note that the previous line we have already flipped the sign.
-        action[..., -1] = torch.where(action[..., -1] == -1, 0.0, 1.0)
-    else:
-        action[..., -1] = (action[..., -1] + 1) / 2
-
-    return action
 
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
