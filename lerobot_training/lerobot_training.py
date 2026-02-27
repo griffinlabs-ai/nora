@@ -1,7 +1,7 @@
 
 import os
 import logging
-from typing import List, Any, Optional
+from typing import Collection, List, Any, Optional
 from dataclasses import dataclass
 import pathlib
 
@@ -64,7 +64,11 @@ class TrainingConfig:
         self.gradient_clipping = gradient_clipping
         ## In Nora's pretraining, the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open. While some environments have -1 = open, +1 = close. Setting this to True will invert the gripper action(map -1 to 1, +1 to 0)
         self.invert_grippler_action = invert_grippler_action
-        self.image_key = 'observation.images.head'
+        self.image_keys = (
+            'observation.images.head',
+            'observation.images.hand_left',
+            'observation.images.hand_right',
+        )
         self.action_key = 'action'
         self.task_key = 'task'
         self.fps = 30
@@ -97,14 +101,14 @@ def load_and_prepare_dataset(config: TrainingConfig) -> tuple[MultiLeRobotDatase
     }
     return dataset, norm_stats
 
-def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
+def agibot_world_to_nora_instance(batch: dict[str, Any], img_keys: Collection[str]):
     """
     Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
     - Merge `actions.joint.position` and `actions.effector.position` into `action`, discarding other actions.
     - Invert the gripper action by 1-x.
-    - Discard all `observation.*` except the one matching `img_key`.
+    - Keep only the observation image keys in `img_keys`.
     """
-    image = batch[img_key]
+    images = {k: batch[k] for k in img_keys}
     prev_dim_sizes = batch['actions.joint.position'].shape[:2]
     action = torch.cat(
         [
@@ -113,8 +117,8 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
         ],
         dim = -1
     ).view(*prev_dim_sizes, 16)
-    batch = {k:v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.')}
-    batch[img_key] = image
+    batch = {k: v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.')}
+    batch.update(images)
     batch['action'] = action
     return batch
 
@@ -163,10 +167,13 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         self.transformer_processor.tokenizer.padding_side = 'left'
 
     def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
-        pixel_values = transition['observation'][self.config.image_key]
-        pixel_values = [
-            torchvision.transforms.functional.to_pil_image(pv)
-            for pv in pixel_values
+        # list of lists, shape (batch_size, n_keys)
+        per_sample_images = [
+            [
+                torchvision.transforms.functional.to_pil_image(img)
+                for img in image_tuple
+            ]
+            for image_tuple in zip(*(transition['observation'][k] for k in self.config.image_keys))
         ]
 
         action = transition['action']
@@ -179,11 +186,11 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "image", "image": pv,
-                        "resized_height": 224,
-                        "resized_width": 224,},
+                        *(
+                            {"type": "image", "image": img, "resized_height": 224, "resized_width": 224}
+                            for img in imgs
+                        ),
                         {"type": "text", "text": l},
-
                     ],
                 },
                 {
@@ -193,7 +200,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                     ],
                 }
             ]
-            for pv, l, act in zip(pixel_values, lang, vlm_action)
+            for imgs, l, act in zip(per_sample_images, lang, vlm_action)
         ]
 
         text = self.transformer_processor.apply_chat_template(
@@ -257,7 +264,7 @@ def make_policy_processor(
             NoraPolicyProcessorStep(config),
         ],
         to_transition=lambda batch:
-            lerobot.processor.converters.batch_to_transition(agibot_world_to_nora_instance(batch, config.image_key)),
+            lerobot.processor.converters.batch_to_transition(agibot_world_to_nora_instance(batch, config.image_keys)),
         to_output=lerobot.processor.converters.transition_to_batch,
     )
 
