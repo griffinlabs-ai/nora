@@ -14,6 +14,7 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers import get_scheduler
 
 import lerobot.processor
+import lerobot.datasets.utils
 from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
 from lerobot.configs.types import  NormalizationMode, PipelineFeatureType
 from qwen_vl_utils import process_vision_info
@@ -40,7 +41,7 @@ class TrainingConfig:
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
         lerobot_dataset_repo_id: str | None = None,
-        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_head_only/agibotworld/",
+        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_3_images/agibotworld/",
         wandb_project_name: str = "Nora VLA with LeRobotDataset",
         checkpoint_save_frequency: int = 20000,
         logging_frequency: int = 100,
@@ -70,10 +71,10 @@ class TrainingConfig:
         self.action_chunk_size = 50
 
 # --- 2. Data Loading and Preprocessing ---
-def load_and_prepare_dataset(config: TrainingConfig) -> MultiLeRobotDataset:
-    """Loads and prepares the LeRobot dataset."""
-    delta_timestamps = [i / config.fps for i in range(config.action_chunk_size)]
-    return MultiLeRobotDataset(
+def load_and_prepare_dataset(config: TrainingConfig) -> tuple[MultiLeRobotDataset, dict[str, dict[str, np.ndarray]]]:
+    """Loads and prepares the LeRobot dataset and its normalization stats."""
+    delta_timestamps = [i / config.fps for i in range(-1, config.action_chunk_size)]
+    dataset = MultiLeRobotDataset(
         [p.name for p in pathlib.Path(config.lerobot_dataset_root).glob("task_*")],
         root = config.lerobot_dataset_root,
         delta_timestamps = {
@@ -81,6 +82,20 @@ def load_and_prepare_dataset(config: TrainingConfig) -> MultiLeRobotDataset:
             "actions.effector.position": delta_timestamps,
         }
     )
+    # Load and prepare normalization stats
+    raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
+        lerobot.datasets.utils.load_json(pathlib.Path(config.lerobot_dataset_root) / 'norm_stats.json')
+    )['norm_stats']
+    # gripper min and max are currently hardcoded to 0 and 1.
+    # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
+    # so the stats would have to be transformed as well, and order reversed (e.g. q01 becomes 1-q99)
+    norm_stats = {
+        "action": {
+            "min": np.append(np.insert(raw_norm_stats['actions.joint.position']['q01'], 7, 0), 0),
+            "max": np.append(np.insert(raw_norm_stats['actions.joint.position']['q99'], 7, 1), 1),
+        }
+    }
+    return dataset, norm_stats
 
 def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
     """
@@ -106,6 +121,33 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_key):
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("abs2delta_action_processor")
+class Abs2DeltaActionProcessorStep(lerobot.processor.PolicyActionProcessorStep):
+    """
+    Convert action tensor from absolute space to delta space. Reduces chunk size by 1.
+    Expects an action shape of [..., chunk_size, degrees_of_freedom].
+    Expects the first frame in the chunk to be the latest past frame,
+    only used to calculate the first delta, never returned.
+    """
+
+    mask: torch.Tensor
+    """
+    Mask of which action tensor dimensions to convert to delta space.
+    `True` dimensions output delta space, `False` dimensions keep absolute space.
+    """
+
+    def action(self, action):
+        assert self.mask.shape[-1] == action.shape[-1]
+        future_actions = action[...,1:,:]
+        deltas = future_actions - action[...,:-1,:]
+        return torch.where(self.mask.expand(future_actions.shape), deltas, future_actions)
+
+    def transform_features(self, features):
+        old_shape = features['ACTION']['action'].shape
+        features['ACTION'].shape = old_shape[:-2] + (old_shape[-2] - 1, old_shape[-1]) 
+        return features
 
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
@@ -195,21 +237,22 @@ def make_policy_processor(
         config: TrainingConfig,
         norm_stats: dict[str, dict[str, np.ndarray]],
 ) -> lerobot.processor.PolicyProcessorPipeline:
-    # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
-    # so the stats would have to be transformed as well, and order reversed (e.g. p10 becomes p90)
-    norm_stats = {
-        "action": {
-            "min": np.append(np.insert(norm_stats['actions.joint.position']['min'], 7, 0), 0),
-            "max": np.append(np.insert(norm_stats['actions.joint.position']['max'], 7, 1), 1),
-        }
-    }
-
     norm_map = {
         'ACTION': NormalizationMode.MIN_MAX,
     }
 
     return lerobot.processor.PolicyProcessorPipeline(
         steps = [
+            Abs2DeltaActionProcessorStep(
+                # left arm joints x7 + left gripper + right arm joints x7 + right gripper
+                mask = torch.tensor(
+                    [
+                        True, True, True, True, True, True, True, False,
+                        True, True, True, True, True, True, True, False,
+                    ],
+                    dtype=torch.bool,
+                ),
+            ),
             lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
             NoraPolicyProcessorStep(config),
         ],
@@ -252,8 +295,8 @@ def train(config: TrainingConfig):
     model = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
-        dataset = load_and_prepare_dataset(config)
-        policy_preprocessor = make_policy_processor(config, dataset.stats)
+        dataset, norm_stats = load_and_prepare_dataset(config)
+        policy_preprocessor = make_policy_processor(config, norm_stats)
 
     train_dataloader = DataLoader(
         dataset,
