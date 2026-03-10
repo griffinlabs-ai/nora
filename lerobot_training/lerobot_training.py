@@ -1,10 +1,15 @@
+import sys
+import pathlib
+
+_root = pathlib.Path(__file__).resolve().parent.parent  # repo root
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
 
 import math
 import os
 import logging
 from typing import Collection, List, Any, Optional
 from dataclasses import dataclass
-import pathlib
 
 import torch
 from torch.utils.data import DataLoader, default_collate, Dataset, ConcatDataset
@@ -48,6 +53,7 @@ class TrainingConfig:
         logging_frequency: int = 100,
         gradient_clipping: Optional[float] = None,
         invert_grippler_action: bool = True,
+        dataloader_num_workers: int = 4,
     ):
         self.per_device_batch_size = per_device_batch_size
         self.learning_rate = learning_rate
@@ -65,6 +71,7 @@ class TrainingConfig:
         self.gradient_clipping = gradient_clipping
         ## In Nora's pretraining, the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open. While some environments have -1 = open, +1 = close. Setting this to True will invert the gripper action(map -1 to 1, +1 to 0)
         self.invert_grippler_action = invert_grippler_action
+        self.dataloader_num_workers = dataloader_num_workers
         self.image_keys = (
             'observation.images.head',
             'observation.images.hand_left',
@@ -86,7 +93,7 @@ def load_and_prepare_dataset(config: TrainingConfig) -> tuple[Dataset, dict[str,
     task_roots = list(pathlib.Path(config.lerobot_dataset_root).glob("task_*"))
     dataset = ConcatDataset([
         SkipEpisodesLeRobotDataset(task_root.name, root=task_root, delta_timestamps=delta_timestamps)
-        for task_root in tqdm(task_roots, desc="Loading tasks")
+        for task_root in tqdm(task_roots, desc="Loading AgiBot World Beta datasets")
     ])
     # Load and prepare normalization stats
     raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
@@ -312,6 +319,7 @@ def train(config: TrainingConfig):
         batch_size=config.per_device_batch_size,
         collate_fn=lambda examples: policy_preprocessor(default_collate(examples)),
         shuffle=True,
+        num_workers=config.dataloader_num_workers,
     )
 
     optimizer = torch.optim.AdamW(
