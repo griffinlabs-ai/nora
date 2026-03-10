@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pathlib
 
 import torch
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader, default_collate, Dataset, ConcatDataset
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -15,7 +15,6 @@ from transformers import get_scheduler
 
 import lerobot.processor
 import lerobot.datasets.utils
-from lerobot.datasets.lerobot_dataset import MultiLeRobotDataset
 from lerobot.configs.types import  NormalizationMode, PipelineFeatureType
 from qwen_vl_utils import process_vision_info
 import numpy as np
@@ -24,6 +23,7 @@ from tqdm import tqdm
 
 import torchvision
 
+from utils.skip_episodes_lerobot_dataset import SkipEpisodesLeRobotDataset
 
 
 logger = get_logger(__name__)
@@ -75,20 +75,21 @@ class TrainingConfig:
         self.action_chunk_size = 50
 
 # --- 2. Data Loading and Preprocessing ---
-def load_and_prepare_dataset(config: TrainingConfig) -> tuple[MultiLeRobotDataset, dict[str, dict[str, np.ndarray]]]:
+def load_and_prepare_dataset(config: TrainingConfig) -> tuple[Dataset, dict[str, dict[str, np.ndarray]]]:
     """Loads and prepares the LeRobot dataset and its normalization stats."""
     delta_timestamps = [i / config.fps for i in range(-1, config.action_chunk_size)]
-    dataset = MultiLeRobotDataset(
-        [p.name for p in pathlib.Path(config.lerobot_dataset_root).glob("task_*")],
-        root = config.lerobot_dataset_root,
-        delta_timestamps = {
-            "actions.joint.position": delta_timestamps,
-            "actions.effector.position": delta_timestamps,
-        }
-    )
+    delta_timestamps = {
+        "actions.joint.position": delta_timestamps,
+        "actions.effector.position": delta_timestamps,
+    }
+    task_roots = list(pathlib.Path(config.lerobot_dataset_root).glob("task_*"))
+    dataset = ConcatDataset([
+        SkipEpisodesLeRobotDataset(task_root.name, root=task_root, delta_timestamps=delta_timestamps)
+        for task_root in tqdm(task_roots, desc="Loading tasks")
+    ])
     # Load and prepare normalization stats
     raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
-        lerobot.datasets.utils.load_json(pathlib.Path(config.lerobot_dataset_root) / 'norm_stats.json')
+        lerobot.datasets.utils.load_json(pathlib.Path(config.lerobot_dataset_root) / 'delta_norm_stats.json')
     )['norm_stats']
     # gripper min and max are currently hardcoded to 0 and 1.
     # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
