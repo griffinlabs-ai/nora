@@ -1,4 +1,5 @@
 
+import math
 import os
 import logging
 from typing import Collection, List, Any, Optional
@@ -32,11 +33,11 @@ logger = get_logger(__name__)
 class TrainingConfig:
     def __init__(
         self,
-        per_device_batch_size: int = 1,
+        per_device_batch_size: int = 256,
         learning_rate: float = 5e-5,
         gradient_accumulation_steps: int = 1,
         num_warmup_steps: int = 1000,
-        max_train_steps: int = 60000,
+        max_epochs: int = 5,
         output_dir: str = './nora_finetune_object',
         resume_from_checkpoint: str = '',
         load_model_weights: Optional[str] = None,
@@ -52,7 +53,7 @@ class TrainingConfig:
         self.learning_rate = learning_rate
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_warmup_steps = num_warmup_steps
-        self.max_train_steps = max_train_steps
+        self.max_epochs = max_epochs
         self.output_dir = output_dir
         self.resume_from_checkpoint = resume_from_checkpoint
         self.load_model_weights = load_model_weights
@@ -321,17 +322,20 @@ def train(config: TrainingConfig):
         eps=1e-8,
     )
 
-    max_train_steps = config.max_train_steps
+    model, optimizer, train_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader
+    )
+
+    max_train_steps = len(train_dataloader) * config.max_epochs
+    max_optim_steps = math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
-        num_warmup_steps=config.num_warmup_steps*accelerator.num_processes,
-        num_training_steps=config.max_train_steps*accelerator.num_processes
+        num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps),
+        num_training_steps=max_optim_steps
     )
 
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader,lr_scheduler
-    )
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
     if config.resume_from_checkpoint:
         accelerator.load_state(config.resume_from_checkpoint)
@@ -340,14 +344,14 @@ def train(config: TrainingConfig):
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
-    logger.info(f"  Num steps = {config.max_train_steps}")
+    logger.info(f"  Num steps = {max_train_steps}")
     logger.info(f"  Instantaneous batch size per device = {config.per_device_batch_size}")
     logger.info(f"  Total train batch size = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {max_train_steps}")
+    logger.info(f"  Total optimization steps = {max_optim_steps}")
 
     completed_steps = 0
-    progress_bar = tqdm(range(completed_steps,max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(completed_steps, max_train_steps), disable=not accelerator.is_local_main_process)
 
     while completed_steps < max_train_steps:
         for batch in train_dataloader:
@@ -358,11 +362,12 @@ def train(config: TrainingConfig):
 
                 accelerator.backward(loss)
 
+                progress_bar.update(1)
+                completed_steps += 1
+
                 if accelerator.sync_gradients:
-                    progress_bar.update(1)
                     if config.gradient_clipping is not None:
                         accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
-                    completed_steps += 1
 
                     optimizer.step()
                     lr_scheduler.step()
