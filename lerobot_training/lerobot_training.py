@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 
 import torchvision
+from torchvision.transforms import v2 as T_v2
 
 from utils.skip_episodes_lerobot_dataset import SkipEpisodesLeRobotDataset
 
@@ -54,6 +55,7 @@ class TrainingConfig:
         gradient_clipping: Optional[float] = None,
         invert_grippler_action: bool = True,
         dataloader_num_workers: int = 4,
+        image_augmentation: bool = True,
     ):
         self.per_device_batch_size = per_device_batch_size
         self.learning_rate = learning_rate
@@ -72,6 +74,7 @@ class TrainingConfig:
         ## In Nora's pretraining, the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open. While some environments have -1 = open, +1 = close. Setting this to True will invert the gripper action(map -1 to 1, +1 to 0)
         self.invert_grippler_action = invert_grippler_action
         self.dataloader_num_workers = dataloader_num_workers
+        self.image_augmentation = image_augmentation
         self.image_keys = (
             'observation.images.head',
             'observation.images.hand_left',
@@ -90,9 +93,26 @@ def load_and_prepare_dataset(config: TrainingConfig) -> tuple[Dataset, dict[str,
         "actions.joint.position": delta_timestamps,
         "actions.effector.position": delta_timestamps,
     }
+    if config.image_augmentation:
+        image_transforms = T_v2.Compose([
+            # Note that the dlimp RandomResizedCrop used by the original RLDS dataloader
+            # seems to handle `ratio` differently: ratio is measured in normalized coordinates (between 0.0 and 1.0)
+            # hence ratio=(1.0, 1.0) would crop at the same aspect ratio as the original image
+            # (https://github.com/kvablack/dlimp/blob/5edaa4691567873d495633f2708982b42edf1972/dlimp/augmentations.py#L6)
+            # With torchvision to crop at the original aspect ratio, we need to pass the ratio of actual pixels
+            T_v2.RandomResizedCrop(size=(224, 224), scale=(0.9, 0.9), ratio=(4/3, 4/3)),
+            T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        ])
+    else:
+        image_transforms = None
     task_roots = list(pathlib.Path(config.lerobot_dataset_root).glob("task_*"))
     dataset = ConcatDataset([
-        SkipEpisodesLeRobotDataset(task_root.name, root=task_root, delta_timestamps=delta_timestamps)
+        SkipEpisodesLeRobotDataset(
+            task_root.name,
+            root=task_root,
+            delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
+        )
         for task_root in tqdm(task_roots, desc="Loading AgiBot World Beta datasets")
     ])
     # Load and prepare normalization stats
