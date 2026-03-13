@@ -8,7 +8,7 @@ if str(_root) not in sys.path:
 import math
 import os
 import logging
-from typing import Collection, List, Any, Optional
+from typing import Callable, Collection, List, Any, Optional
 from dataclasses import dataclass
 
 import torch
@@ -88,7 +88,7 @@ class TrainingConfig:
 # --- 2. Data Loading and Preprocessing ---
 def load_and_prepare_dataset(config: TrainingConfig) -> tuple[Dataset, dict[str, dict[str, np.ndarray]]]:
     """Loads and prepares the LeRobot dataset and its normalization stats."""
-    delta_timestamps = [i / config.fps for i in range(-1, config.action_chunk_size)]
+    delta_timestamps = [i / config.fps for i in range(config.action_chunk_size)]
     delta_timestamps = {
         "actions.joint.position": delta_timestamps,
         "actions.effector.position": delta_timestamps,
@@ -135,9 +135,7 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_keys: Collection[st
     Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
     - Merge `actions.joint.position` and `actions.effector.position` into `action`, discarding other actions.
     - Invert the gripper action by 1-x.
-    - Keep only the observation image keys in `img_keys`.
     """
-    images = {k: batch[k] for k in img_keys}
     prev_dim_sizes = batch['actions.joint.position'].shape[:2]
     action = torch.cat(
         [
@@ -146,8 +144,7 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_keys: Collection[st
         ],
         dim = -1
     ).view(*prev_dim_sizes, 16)
-    batch = {k: v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.')}
-    batch.update(images)
+    batch = {k: v for k, v in batch.items() if not k.startswith('actions.')}
     batch['action'] = action
     return batch
 
@@ -157,12 +154,10 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
 
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("abs2delta_action_processor")
-class Abs2DeltaActionProcessorStep(lerobot.processor.PolicyActionProcessorStep):
+class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
     """
-    Convert action tensor from absolute space to delta space. Reduces chunk size by 1.
+    Convert action tensor from absolute space to delta space.
     Expects an action shape of [..., chunk_size, degrees_of_freedom].
-    Expects the first frame in the chunk to be the latest past frame,
-    only used to calculate the first delta, never returned.
     """
 
     mask: torch.Tensor
@@ -171,15 +166,22 @@ class Abs2DeltaActionProcessorStep(lerobot.processor.PolicyActionProcessorStep):
     `True` dimensions output delta space, `False` dimensions keep absolute space.
     """
 
-    def action(self, action):
+    get_reference_state: Callable[[lerobot.processor.EnvTransition], torch.Tensor]
+    """
+    Function to get the reference state for the delta transform.
+    """
+
+    def __call__(self, transition):
+        new_transition = transition.copy()
+
+        action = transition['action']
+
         assert self.mask.shape[-1] == action.shape[-1]
-        future_actions = action[...,1:,:]
-        deltas = future_actions - action[...,:-1,:]
-        return torch.where(self.mask.expand(future_actions.shape), deltas, future_actions)
+        deltas = action - self.get_reference_state(transition).unsqueeze(-2)
+        new_transition['action'] = torch.where(self.mask.expand(action.shape), deltas, action)
+        return new_transition
 
     def transform_features(self, features):
-        old_shape = features['ACTION']['action'].shape
-        features['ACTION'].shape = old_shape[:-2] + (old_shape[-2] - 1, old_shape[-1]) 
         return features
 
 @dataclass
@@ -288,6 +290,16 @@ def make_policy_processor(
                     ],
                     dtype=torch.bool,
                 ),
+                get_reference_state=lambda transition: 
+                    torch.cat(
+                        [
+                            transition['observation']['observation.state.joint.position'][:, :7],
+                            torch.zeros(*transition['observation']['observation.state.joint.position'].shape[:-1], 1),
+                            transition['observation']['observation.state.joint.position'][:, 7:],
+                            torch.zeros(*transition['observation']['observation.state.joint.position'].shape[:-1], 1),
+                        ],
+                        dim=-1
+                    ),
             ),
             lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
             NoraPolicyProcessorStep(config),
