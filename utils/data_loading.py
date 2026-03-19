@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Callable, Generic, Iterable
+from scipy.interpolate import CubicSpline
 import torch
 from torch.utils.data import Dataset
 from typing import Any
@@ -26,6 +27,55 @@ class PreprocessedDataset(Dataset, Generic[TOutput]):
 
     def __len__(self):
         return len(self.dataset)
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("resample_action_processor")
+class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Resample the action tensor from one chunk size to another, by cubic spline interpolation.
+    """
+
+    target_chunk_size: int
+
+    state_key: str = 'observation.state'
+    """
+    Key for the state tensor that corresponds to the action tensor.
+    """
+
+    def __call__(self, transition):
+        action = transition['action']
+        initial_state = transition['observation'][self.state_key]
+        orig_chunk_size = action.shape[0]
+
+        if orig_chunk_size == self.target_chunk_size:
+            return transition
+
+        new_transition = transition.copy()        
+
+        if orig_chunk_size % self.target_chunk_size == 0:
+            # If the original chunk size is a multiple of the target chunk size, we can simply take every n-th action.
+            step_size = orig_chunk_size // self.target_chunk_size
+            new_transition['action'] = action[step_size-1::step_size]
+            return new_transition
+        else:
+            new_transition['action'] = self._interpolate(action, initial_state, orig_chunk_size)
+            return new_transition
+
+    def _interpolate(self, action, initial_state, orig_chunk_size):
+        trajectory = torch.cat([initial_state.unsqueeze(0), action], dim=0)
+        old_times = np.linspace(0, 1, orig_chunk_size + 1)
+        new_times = np.linspace(1 / self.target_chunk_size, 1, self.target_chunk_size)
+
+        traj_np = trajectory.cpu().numpy()
+        cs = CubicSpline(old_times, traj_np)
+        resampled = cs(new_times)
+
+        return torch.from_numpy(resampled).to(
+            dtype=action.dtype, device=action.device
+        )
+
+    def transform_features(self, features):
+        return features
 
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("abs2delta_action_processor")
@@ -120,6 +170,9 @@ def load_dataset(
     norm_map = {
         'ACTION': NormalizationMode.MIN_MAX,
     }
+    resample_step_if_necessary = [ResampleActionProcessorStep(
+        target_chunk_size = canonical_action_chunk_size,
+    )] if load_action_chunk_size != canonical_action_chunk_size else []
     preprocessor = PolicyProcessorPipeline(
         steps = [
             Abs2DeltaActionProcessorStep(
@@ -131,6 +184,7 @@ def load_dataset(
                     dtype=torch.bool,
                 )
             ),
+            *resample_step_if_necessary,
             lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
         ],
         to_transition=lambda batch:
