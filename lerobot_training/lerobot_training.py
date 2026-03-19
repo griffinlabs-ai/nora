@@ -8,11 +8,11 @@ if str(_root) not in sys.path:
 import math
 import os
 import logging
-from typing import Callable, Collection, List, Any, Optional
+from typing import List, Any, Optional
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, default_collate, Dataset, ConcatDataset
+from torch.utils.data import DataLoader, default_collate
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -20,123 +20,70 @@ from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers import get_scheduler
 
 import lerobot.processor
-import lerobot.datasets.utils
-from lerobot.configs.types import  NormalizationMode, PipelineFeatureType
+from lerobot.configs.types import  PipelineFeatureType
 from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
 
 
 import torchvision
-from torchvision.transforms import v2 as T_v2
 
-from utils.skip_episodes_lerobot_dataset import SkipEpisodesLeRobotDataset
+from utils.data_loading import load_dataset
 
 
 logger = get_logger(__name__)
 
 # --- 1. Configuration ---
+@dataclass
 class TrainingConfig:
-    def __init__(
-        self,
-        per_device_batch_size: int = 256,
-        learning_rate: float = 5e-5,
-        gradient_accumulation_steps: int = 1,
-        num_warmup_steps: int = 1000,
-        max_epochs: int = 5,
-        output_dir: str = './nora_finetune_object',
-        resume_from_checkpoint: str = '',
-        load_model_weights: Optional[str] = None,
-        lerobot_dataset_repo_id: str | None = None,
-        lerobot_dataset_root: str = "/home/ubuntu/agibot-world-lerobot-us-east-1/data/sample_dataset_lerobot_3_images/agibotworld/",
-        wandb_project_name: str = "Nora VLA with LeRobotDataset",
-        checkpoint_save_frequency: int = 20000,
-        logging_frequency: int = 100,
-        gradient_clipping: Optional[float] = None,
-        invert_grippler_action: bool = True,
-        dataloader_num_workers: int = 4,
-        image_augmentation: bool = True,
-    ):
-        self.per_device_batch_size = per_device_batch_size
-        self.learning_rate = learning_rate
-        self.gradient_accumulation_steps = gradient_accumulation_steps
-        self.num_warmup_steps = num_warmup_steps
-        self.max_epochs = max_epochs
-        self.output_dir = output_dir
-        self.resume_from_checkpoint = resume_from_checkpoint
-        self.load_model_weights = load_model_weights
-        self.lerobot_dataset_repo_id = lerobot_dataset_repo_id
-        self.lerobot_dataset_root = lerobot_dataset_root
-        self.wandb_project_name = wandb_project_name
-        self.checkpoint_save_frequency = checkpoint_save_frequency
-        self.logging_frequency = logging_frequency
-        self.gradient_clipping = gradient_clipping
-        ## In Nora's pretraining, the RLDS dataloader aligns gripper actions such that 0 = close, 1 = open. While some environments have -1 = open, +1 = close. Setting this to True will invert the gripper action(map -1 to 1, +1 to 0)
-        self.invert_grippler_action = invert_grippler_action
-        self.dataloader_num_workers = dataloader_num_workers
-        self.image_augmentation = image_augmentation
-        self.image_keys = (
-            'observation.images.head',
-            'observation.images.hand_left',
-            'observation.images.hand_right',
-        )
-        self.action_key = 'action'
-        self.task_key = 'task'
-        self.fps = 30
-        self.action_chunk_size = 50
+    per_device_batch_size: int = 256
+    learning_rate: float = 5e-5
+    gradient_accumulation_steps: int = 1
+    num_warmup_steps: int = 1000
+    max_epochs: int = 5
+    output_dir: str = './nora_finetune_object'
+    resume_from_checkpoint: str = ''
+    load_model_weights: Optional[str] = None
+    agibot_world_root: str = "data/agibot/tasks"
+    wandb_project_name: str = "Nora VLA with LeRobotDataset"
+    checkpoint_save_frequency: int = 20000
+    logging_frequency: int = 100
+    gradient_clipping: Optional[float] = None
+    dataloader_num_workers: int = 4
+    image_augmentation: bool = True
+    action_chunk_size: int = 50
 
 # --- 2. Data Loading and Preprocessing ---
-def load_and_prepare_dataset(config: TrainingConfig) -> tuple[Dataset, dict[str, dict[str, np.ndarray]]]:
-    """Loads and prepares the LeRobot dataset and its normalization stats."""
-    delta_timestamps = [i / config.fps for i in range(config.action_chunk_size)]
-    delta_timestamps = {
-        "actions.joint.position": delta_timestamps,
-        "actions.effector.position": delta_timestamps,
-    }
-    if config.image_augmentation:
-        image_transforms = T_v2.Compose([
-            # Note that the dlimp RandomResizedCrop used by the original RLDS dataloader
-            # seems to handle `ratio` differently: ratio is measured in normalized coordinates (between 0.0 and 1.0)
-            # hence ratio=(1.0, 1.0) would crop at the same aspect ratio as the original image
-            # (https://github.com/kvablack/dlimp/blob/5edaa4691567873d495633f2708982b42edf1972/dlimp/augmentations.py#L6)
-            # With torchvision to crop at the original aspect ratio, we need to pass the ratio of actual pixels
-            T_v2.RandomResizedCrop(size=(224, 224), scale=(0.9, 0.9), ratio=(4/3, 4/3)),
-            T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        ])
-    else:
-        image_transforms = None
-    task_roots = list(pathlib.Path(config.lerobot_dataset_root).glob("task_*"))
-    dataset = ConcatDataset([
-        SkipEpisodesLeRobotDataset(
-            task_root.name,
-            root=task_root,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-        )
-        for task_root in tqdm(task_roots, desc="Loading AgiBot World Beta datasets")
-    ])
-    # Load and prepare normalization stats
-    raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
-        lerobot.datasets.utils.load_json(pathlib.Path(config.lerobot_dataset_root) / 'delta_norm_stats.json')
-    )['norm_stats']
-    # gripper min and max are currently hardcoded to 0 and 1.
-    # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
-    # so the stats would have to be transformed as well, and order reversed (e.g. q01 becomes 1-q99)
-    norm_stats = {
-        "action": {
-            "min": np.append(np.insert(raw_norm_stats['actions.joint.position']['q01'], 7, 0), 0),
-            "max": np.append(np.insert(raw_norm_stats['actions.joint.position']['q99'], 7, 1), 1),
-        }
-    }
-    return dataset, norm_stats
+def load_agibot_world_dataset(
+    root: str,
+    canonical_action_chunk_size: int,
+    use_image_augmentation: bool,
+):
+    return load_dataset(
+        root,
+        ("actions.joint.position", "actions.effector.position"),
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        use_image_augmentation,
+        raw_fps = 30,
+        aspect_ratio = 4/3,
+        instance_transform = agibot_world_to_nora_instance,
+        norm_stats_transform = lambda norm_stats: {
+            "action": {
+                "min": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
+                "max": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
+            }
+        },
+    )
 
-def agibot_world_to_nora_instance(batch: dict[str, Any], img_keys: Collection[str]):
+def agibot_world_to_nora_instance(batch: dict[str, Any]):
     """
     Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
-    - Merge `actions.joint.position` and `actions.effector.position` into `action`, discarding other actions.
+    - Merge relevant actions into `action`, discarding other actions.
+    - Merge relevant states into `observation.state`, discarding other states.
     - Invert the gripper action by 1-x.
     """
-    prev_dim_sizes = batch['actions.joint.position'].shape[:2]
+    prev_dim_sizes = batch['actions.joint.position'].shape[:-1]
     action = torch.cat(
         [
             batch['actions.joint.position'].view(*prev_dim_sizes, 2, 7),
@@ -144,8 +91,19 @@ def agibot_world_to_nora_instance(batch: dict[str, Any], img_keys: Collection[st
         ],
         dim = -1
     ).view(*prev_dim_sizes, 16)
-    batch = {k: v for k, v in batch.items() if not k.startswith('actions.')}
+    state = torch.cat(
+        [
+            batch['observation.states.joint.position'].view(2, 7),
+            # Effector position below is only used for its shape, the values should be unused through the
+            # delta transform mask. The values are in meters rather than [0, 1] so not actually comparable.
+            batch['observation.states.effector.position'].view(2, 1),
+        ],
+        dim = -1
+    ).view(16)
+    batch = {k: v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.states.')}
     batch['action'] = action
+    batch['observation.state'] = state
+    batch['action_dim_is_pad'] = torch.zeros(action.shape[-1], dtype=torch.bool)
     return batch
 
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
@@ -153,42 +111,14 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     return ''.join([f"<robot_action_{token}>" for token in tokens])
 
 @dataclass
-@lerobot.processor.ProcessorStepRegistry.register("abs2delta_action_processor")
-class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
-    """
-    Convert action tensor from absolute space to delta space.
-    Expects an action shape of [..., chunk_size, degrees_of_freedom].
-    """
-
-    mask: torch.Tensor
-    """
-    Mask of which action tensor dimensions to convert to delta space.
-    `True` dimensions output delta space, `False` dimensions keep absolute space.
-    """
-
-    get_reference_state: Callable[[lerobot.processor.EnvTransition], torch.Tensor]
-    """
-    Function to get the reference state for the delta transform.
-    """
-
-    def __call__(self, transition):
-        new_transition = transition.copy()
-
-        action = transition['action']
-
-        assert self.mask.shape[-1] == action.shape[-1]
-        deltas = action - self.get_reference_state(transition).unsqueeze(-2)
-        new_transition['action'] = torch.where(self.mask.expand(action.shape), deltas, action)
-        return new_transition
-
-    def transform_features(self, features):
-        return features
-
-@dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
-    config: TrainingConfig
+    IMAGE_KEYS = (
+        'observation.images.head',
+        'observation.images.hand_left',
+        'observation.images.hand_right',
+    )
 
     def __post_init__(self):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
@@ -204,13 +134,17 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                 torchvision.transforms.functional.to_pil_image(img)
                 for img in image_tuple
             ]
-            for image_tuple in zip(*(transition['observation'][k] for k in self.config.image_keys))
+            for image_tuple in zip(*(transition['observation'][k] for k in self.IMAGE_KEYS))
         ]
 
-        action = transition['action']
-        lang = transition['complementary_data']['task']
-        fast_tokens = self.fast_tokenizer(action.cpu())
+        fast_tokens = []
+        for i in range(transition['action'].shape[0]):
+            action = transition['action'][i]
+            action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
+            fast_tokens.extend(self.fast_tokenizer(action.cpu()))
+
         vlm_action = [map_fast_token_to_vlm_action(ft) for ft in fast_tokens]
+        lang = transition['complementary_data']['task']
 
         messages = [
             [
@@ -271,42 +205,10 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             PipelineFeatureType.OBSERVATION: {},
         }
 
-def make_policy_processor(
-        config: TrainingConfig,
-        norm_stats: dict[str, dict[str, np.ndarray]],
-) -> lerobot.processor.PolicyProcessorPipeline:
-    norm_map = {
-        'ACTION': NormalizationMode.MIN_MAX,
-    }
-
+def make_policy_processor() -> lerobot.processor.PolicyProcessorPipeline:
     return lerobot.processor.PolicyProcessorPipeline(
-        steps = [
-            Abs2DeltaActionProcessorStep(
-                # left arm joints x7 + left gripper + right arm joints x7 + right gripper
-                mask = torch.tensor(
-                    [
-                        True, True, True, True, True, True, True, False,
-                        True, True, True, True, True, True, True, False,
-                    ],
-                    dtype=torch.bool,
-                ),
-                get_reference_state=lambda transition: 
-                    torch.cat(
-                        [
-                            transition['observation']['observation.state.joint.position'][:, :7],
-                            torch.zeros(*transition['observation']['observation.state.joint.position'].shape[:-1], 1),
-                            transition['observation']['observation.state.joint.position'][:, 7:],
-                            torch.zeros(*transition['observation']['observation.state.joint.position'].shape[:-1], 1),
-                        ],
-                        dim=-1
-                    ),
-            ),
-            lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
-            NoraPolicyProcessorStep(config),
-        ],
-        to_transition=lambda batch:
-            lerobot.processor.converters.batch_to_transition(agibot_world_to_nora_instance(batch, config.image_keys)),
-        to_output=lerobot.processor.converters.transition_to_batch,
+        steps = [NoraPolicyProcessorStep()],
+        to_output=lambda tr: tr['complementary_data'],
     )
 
 
@@ -343,8 +245,12 @@ def train(config: TrainingConfig):
     model = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
-        dataset, norm_stats = load_and_prepare_dataset(config)
-        policy_preprocessor = make_policy_processor(config, norm_stats)
+        dataset = load_agibot_world_dataset(
+            root = config.agibot_world_root,
+            canonical_action_chunk_size = config.action_chunk_size,
+            use_image_augmentation = config.image_augmentation,
+        )
+        policy_preprocessor = make_policy_processor()
 
     train_dataloader = DataLoader(
         dataset,
