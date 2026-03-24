@@ -54,7 +54,8 @@ class TrainingConfig:
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 4
     # 【Update to Qwen3 Base Model】
-    model_id: str = "Qwen/Qwen3-VL-4B-Instruct", 
+    model_id: str = "Qwen/Qwen3-VL-4B-Instruct"
+    action_vocab_size: int = 1024
     image_augmentation: bool = True
     action_chunk_size: int = 50
 
@@ -215,7 +216,8 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
-    transformer_processor: Any 
+    config: TrainingConfig
+    transformer_processor: Any
 
     IMAGE_KEYS = (
         'observation.images.head',
@@ -316,10 +318,11 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         }
 
 def make_policy_processor(
+        config: TrainingConfig,
         transformer_processor: Any
 ) -> lerobot.processor.PolicyProcessorPipeline:
     return lerobot.processor.PolicyProcessorPipeline(
-        steps = [NoraPolicyProcessorStep(transformer_processor)],
+        steps = [NoraPolicyProcessorStep(config, transformer_processor)],
         to_output=lambda tr: tr['complementary_data'],
     )
 
@@ -375,7 +378,7 @@ def train(config: TrainingConfig):
             use_image_augmentation = config.image_augmentation,
         )
         dataset = agibot_world + galaxea_open_world_ds
-        policy_preprocessor = make_policy_processor(transformer_processor)
+        policy_preprocessor = make_policy_processor(config, transformer_processor)
 
     train_dataloader = DataLoader(
         dataset,
