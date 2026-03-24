@@ -139,6 +139,7 @@ def agibot_world_to_nora_instance(batch: dict[str, Any]):
     batch['action'] = action
     batch['observation.state'] = state
     batch['action_dim_is_pad'] = torch.zeros(action.shape[-1], dtype=torch.bool)
+    batch['info'] = {"embodiment_prompt": "AgiBot G1 with 2 grippers"}
     return batch
 
 def galaxea_to_nora_instance(batch: dict[str, Any]):
@@ -177,6 +178,7 @@ def galaxea_to_nora_instance(batch: dict[str, Any]):
     batch['action_dim_is_pad'] = torch.tensor(
         [False, False, False, False, False, False, True, False] * 2,
     )
+    batch['info'] = {"embodiment_prompt": "Galaxea R1 Lite"}
     # rename image keys, drop right head image
     batch['observation.images.head'] = batch['observation.images.head_rgb']
     batch['observation.images.hand_left'] = batch['observation.images.left_wrist_rgb']
@@ -225,7 +227,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             fast_tokens.extend(self.fast_tokenizer(action.cpu()))
 
         vlm_action = [map_fast_token_to_vlm_action(ft) for ft in fast_tokens]
-        lang = transition['complementary_data']['task']
+        tasks = transition['complementary_data']['task']
+        embodiment_prompts = transition['info']['embodiment_prompt']
 
         messages = [
             [
@@ -236,7 +239,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                             {"type": "image", "image": img, "resized_height": 224, "resized_width": 224}
                             for img in imgs
                         ),
-                        {"type": "text", "text": l},
+                        {"type": "text", "text": f"[embodiment: {embodiment}] {task}"},
                     ],
                 },
                 {
@@ -246,7 +249,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                     ],
                 }
             ]
-            for imgs, l, act in zip(per_sample_images, lang, vlm_action)
+            for imgs, task, embodiment, act in zip(per_sample_images, tasks, embodiment_prompts, vlm_action)
         ]
 
         text = self.transformer_processor.apply_chat_template(
