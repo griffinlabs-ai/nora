@@ -16,7 +16,10 @@ from torch.utils.data import DataLoader, default_collate
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
+
+# --- Updated Qwen3 Imports ---
+from transformers import AutoProcessor
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from transformers import get_scheduler
 
 import lerobot.processor
@@ -25,11 +28,9 @@ from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
 
-
 import torchvision
 
 from utils.data_loading import load_dataset
-
 
 logger = get_logger(__name__)
 
@@ -53,6 +54,8 @@ class TrainingConfig:
     dataloader_num_workers: int = 4
     image_augmentation: bool = True
     action_chunk_size: int = 50
+    model_id: str = "Qwen/Qwen3-VL-4B-Instruct" 
+    action_vocab_size: int = 2048
 
 # --- 2. Data Loading and Preprocessing ---
 def load_agibot_world_dataset(
@@ -196,6 +199,11 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
+    # Added to accept Qwen3 config and processor
+    config: TrainingConfig 
+    transformer_processor: Any 
+    action_token_min: int = -1
+    action_token_max: int = -1
 
     IMAGE_KEYS = (
         'observation.images.head',
@@ -207,8 +215,16 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
-        self.transformer_processor = AutoProcessor.from_pretrained('declare-lab/nora')
-        self.transformer_processor.tokenizer.padding_side = 'left'
+        # Dynamically calculate Action Token range to replace the original hardcoded values (151665 ~ 153712)
+        action_tokens = [f"<robot_action_{i}>" for i in range(self.config.action_vocab_size)]
+        action_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(action_tokens)
+        action_ids = [id for id in action_ids if id is not None and id != self.transformer_processor.tokenizer.unk_token_id]
+        
+        if action_ids:
+            self.action_token_min = min(action_ids)
+            self.action_token_max = max(action_ids)
+        else:
+            raise ValueError("Action Tokens not found in the Qwen3 vocabulary! Please ensure they were injected during the model loading phase.")
 
     def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
         # list of lists, shape (batch_size, n_keys)
@@ -264,13 +280,13 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             padding=True,
             return_tensors="pt",
         )
-        action_token_min = 151665
-        action_token_max = 153712
+        
         labels = batch_input['input_ids'].clone()
 
+        # Use dynamically calculated action_token_min/max
         for i in range(labels.size(0)):
             seq = labels[i]
-            mask_seq = (seq >= action_token_min) & (seq <= action_token_max)
+            mask_seq = (seq >= self.action_token_min) & (seq <= self.action_token_max)
             nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
             if nonzero_indices.numel() > 0:
                 first_action_index = nonzero_indices[0].item()
@@ -289,21 +305,32 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             PipelineFeatureType.OBSERVATION: {},
         }
 
-def make_policy_processor() -> lerobot.processor.PolicyProcessorPipeline:
+def make_policy_processor(config: TrainingConfig, transformer_processor: Any) -> lerobot.processor.PolicyProcessorPipeline:
+    # Pass config and processor to the step
     return lerobot.processor.PolicyProcessorPipeline(
-        steps = [NoraPolicyProcessorStep()],
+        steps = [NoraPolicyProcessorStep(config=config, transformer_processor=transformer_processor)],
         to_output=lambda tr: tr['complementary_data'],
     )
 
 
 # --- 3. Model Initialization ---
-def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -> Qwen2_5_VLForConditionalGeneration:
-    """Loads the model and processor."""
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        'declare-lab/nora',
+def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
+    """Loads Qwen3, its processor, and injects action tokens."""
+    transformer_processor = AutoProcessor.from_pretrained(config.model_id, trust_remote_code=True)
+    transformer_processor.tokenizer.padding_side = 'left'
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        config.model_id,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2"
+        attn_implementation="flash_attention_2",
+        trust_remote_code=True
     )
+
+    # Inject action tokens
+    action_tokens = [f"<robot_action_{i}>" for i in range(config.action_vocab_size)]
+    transformer_processor.tokenizer.add_tokens(action_tokens, special_tokens=True)
+    model.resize_token_embeddings(len(transformer_processor.tokenizer))
+    accelerator.print(f"Added {len(action_tokens)} action tokens to Qwen3 vocabulary.")
 
     if config.load_model_weights:
         tensors = {}
@@ -314,7 +341,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator) -
         model.load_state_dict(tensors, strict=False)
         accelerator.print("Pretrained weights loaded.")
 
-    return model
+    return model, transformer_processor
 
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
@@ -324,9 +351,9 @@ def train(config: TrainingConfig):
     logger.info(accelerator.state, main_process_only=False)
 
     accelerator.init_trackers(config.wandb_project_name, config=config)
-        #wandb.init(project=config.wandb_project_name)
 
-    model = load_model_and_processor(config, accelerator)
+    # Unpack both model and processor
+    model, transformer_processor = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
         agibot_world = load_agibot_world_dataset(
@@ -340,7 +367,7 @@ def train(config: TrainingConfig):
             use_image_augmentation = config.image_augmentation,
         )
         dataset = agibot_world + galaxea_open_world_ds
-        policy_preprocessor = make_policy_processor()
+        policy_preprocessor = make_policy_processor(config, transformer_processor)
 
     train_dataloader = DataLoader(
         dataset,
@@ -393,7 +420,17 @@ def train(config: TrainingConfig):
         for batch in train_dataloader:
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                outputs = model(**batch)
+                
+                # Filter dictionary keys to prevent unexpected kwargs to Qwen3
+                model_inputs = {
+                    'input_ids': batch['input_ids'],
+                    'attention_mask': batch['attention_mask'],
+                    'pixel_values': batch['pixel_values'],
+                    'image_grid_thw': batch['image_grid_thw'],
+                    'labels': batch['labels']
+                }
+                
+                outputs = model(**model_inputs)
                 loss = outputs.loss
 
                 accelerator.backward(loss)
@@ -420,8 +457,6 @@ def train(config: TrainingConfig):
 
                             logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
                             accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm":total_norm}, step=completed_steps)
-                    #logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
-                    #accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm":total_norm}, step=completed_steps)
 
             if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                 accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
