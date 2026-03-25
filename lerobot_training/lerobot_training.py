@@ -71,8 +71,8 @@ def load_agibot_world_dataset(
         instance_transform = agibot_world_to_nora_instance,
         norm_stats_transform = lambda norm_stats: {
             "action": {
-                "min": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
-                "max": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
+                "q01": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
+                "q99": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
             }
         },
     )
@@ -95,13 +95,13 @@ def load_galaxea_dataset(
         norm_stats_transform = lambda norm_stats:
             {
                 "action": {
-                    "min": np.concatenate([
+                    "q01": np.concatenate([
                         norm_stats['action.left_arm']['q01'],
                         np.array([-1.0, 0.0]),
                         norm_stats['action.right_arm']['q01'],
                         np.array([-1.0, 0.0]),
                     ]),
-                    "max": np.concatenate([
+                    "q99": np.concatenate([
                         norm_stats['action.left_arm']['q99'],
                         np.array([1.0, 1.0]),
                         norm_stats['action.right_arm']['q99'],
