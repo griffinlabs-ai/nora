@@ -168,7 +168,7 @@ def load_dataset(
     norm_stats = norm_stats_transform(raw_norm_stats)
 
     norm_map = {
-        'ACTION': NormalizationMode.MIN_MAX,
+        'ACTION': NormalizationMode.QUANTILES,
     }
     resample_step_if_necessary = [ResampleActionProcessorStep(
         target_chunk_size = canonical_action_chunk_size,
