@@ -12,25 +12,21 @@ from typing import List, Any, Optional
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader, default_collate
+from torch.utils.data import DataLoader
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
-# --- Updated Qwen3 Imports ---
 from transformers import AutoProcessor
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
 from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.configs.types import  PipelineFeatureType
-from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
 
-import torchvision
-
-from utils.data_loading import load_dataset
+from utils.data_loading import collate_with_observation_image_lists, load_dataset
 
 logger = get_logger(__name__)
 
@@ -52,24 +48,27 @@ class TrainingConfig:
     logging_frequency: int = 100
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 4
-    image_augmentation: bool = True
     action_chunk_size: int = 50
     model_id: str = "Qwen/Qwen3-VL-4B-Instruct" 
     action_vocab_size: int = 2048
+    image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
+    """Approximate target number of pixels in the resized image that the model receives."""
 
 # --- 2. Data Loading and Preprocessing ---
 def load_agibot_world_dataset(
     root: str,
     canonical_action_chunk_size: int,
-    use_image_augmentation: bool,
+    image_target_pixels: int,
+    image_processor,
 ):
     return load_dataset(
         root,
         ("actions.joint.position", "actions.effector.position"),
         canonical_action_chunk_size,
         canonical_action_chunk_size,
-        use_image_augmentation,
         raw_fps = 30,
+        image_target_pixels = image_target_pixels,
+        image_processor = image_processor,
         aspect_ratio = 4/3,
         instance_transform = agibot_world_to_nora_instance,
         norm_stats_transform = lambda norm_stats: {
@@ -83,7 +82,8 @@ def load_agibot_world_dataset(
 def load_galaxea_dataset(
     root: str,
     canonical_action_chunk_size: int,
-    use_image_augmentation: bool,
+    image_target_pixels: int,
+    image_processor,
 ):
     assert canonical_action_chunk_size % 2 == 0
     return load_dataset(
@@ -91,9 +91,10 @@ def load_galaxea_dataset(
         ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
         canonical_action_chunk_size // 2,
         canonical_action_chunk_size,
-        use_image_augmentation,
         raw_fps = 15,
         aspect_ratio = 16/9,
+        image_target_pixels = image_target_pixels,
+        image_processor = image_processor,
         instance_transform = galaxea_to_nora_instance,
         norm_stats_transform = lambda norm_stats:
             {
@@ -227,15 +228,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             raise ValueError("Action Tokens not found in the Qwen3 vocabulary! Please ensure they were injected during the model loading phase.")
 
     def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
-        # list of lists, shape (batch_size, n_keys)
-        per_sample_images = [
-            [
-                torchvision.transforms.functional.to_pil_image(img)
-                for img in image_tuple
-            ]
-            for image_tuple in zip(*(transition['observation'][k] for k in self.IMAGE_KEYS))
-        ]
-
+        # list of tuples, shape (batch_size, n_keys) where n_keys is the number of image keys
+        per_sample_images = list(zip(*(transition['observation'][k] for k in self.IMAGE_KEYS)))
         fast_tokens = []
         for i in range(transition['action'].shape[0]):
             action = transition['action'][i]
@@ -252,7 +246,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                     "role": "user",
                     "content": [
                         *(
-                            {"type": "image", "image": img, "resized_height": 224, "resized_width": 224}
+                            {"type": "image", "image": img}
                             for img in imgs
                         ),
                         {"type": "text", "text": f"[embodiment: {embodiment}] {task}"},
@@ -268,15 +262,11 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             for imgs, task, embodiment, act in zip(per_sample_images, tasks, embodiment_prompts, vlm_action)
         ]
 
-        text = self.transformer_processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
-
-        image_inputs, video_inputs = process_vision_info(messages)
-        batch_input = self.transformer_processor(
-            text=text,
-            images=image_inputs,
-            videos=video_inputs,
+        batch_input = self.transformer_processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=False,
+            return_dict=True,
             padding=True,
             return_tensors="pt",
         )
@@ -359,12 +349,14 @@ def train(config: TrainingConfig):
         agibot_world = load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            use_image_augmentation = config.image_augmentation,
+            image_target_pixels = config.image_target_pixels,
+            image_processor = transformer_processor.image_processor,
         )
         galaxea_open_world_ds = load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            use_image_augmentation = config.image_augmentation,
+            image_target_pixels = config.image_target_pixels,
+            image_processor = transformer_processor.image_processor,
         )
         dataset = agibot_world + galaxea_open_world_ds
         policy_preprocessor = make_policy_processor(config, transformer_processor)
@@ -372,7 +364,7 @@ def train(config: TrainingConfig):
     train_dataloader = DataLoader(
         dataset,
         batch_size=config.per_device_batch_size,
-        collate_fn=lambda examples: policy_preprocessor(default_collate(examples)),
+        collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
         shuffle=True,
         num_workers=config.dataloader_num_workers,
     )

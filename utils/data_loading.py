@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from typing import Callable, Generic, Iterable
+from typing import Callable, Generic, Iterable, Mapping
 from scipy.interpolate import CubicSpline
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, default_collate
 from typing import Any
 import pathlib
 import numpy as np
@@ -12,6 +12,7 @@ import lerobot.processor
 import lerobot.datasets.utils
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize, Qwen2VLImageProcessor
 from .skip_episodes_lerobot_dataset import SkipEpisodesLeRobotDataset
 
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
@@ -116,8 +117,9 @@ def load_dataset(
     action_keys: Iterable[str],
     load_action_chunk_size: int,
     canonical_action_chunk_size: int,
-    use_image_augmentation: bool,
     raw_fps: int,
+    image_target_pixels: int,
+    image_processor: Qwen2VLImageProcessor,
     aspect_ratio: float,
     instance_transform: Callable[[dict[str, Any]], dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
@@ -136,18 +138,22 @@ def load_dataset(
         action_key: delta_timestamps
         for action_key in action_keys
     }
-    if use_image_augmentation:
-        image_transforms = T_v2.Compose([
-            # Note that the dlimp RandomResizedCrop used by the original RLDS dataloader
-            # seems to handle `ratio` differently: ratio is measured in normalized coordinates (between 0.0 and 1.0)
-            # hence ratio=(1.0, 1.0) would crop at the same aspect ratio as the original image
-            # (https://github.com/kvablack/dlimp/blob/5edaa4691567873d495633f2708982b42edf1972/dlimp/augmentations.py#L6)
-            # With torchvision to crop at the original aspect ratio, we need to pass the ratio of actual pixels
-            T_v2.RandomResizedCrop(size=(224, 224), scale=(0.9, 0.9), ratio=(aspect_ratio, aspect_ratio)),
-            T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        ])
-    else:
-        image_transforms = None
+    resize_target = smart_resize(
+        (image_target_pixels / aspect_ratio)**0.5,
+        (image_target_pixels * aspect_ratio)**0.5,
+        factor = image_processor.patch_size * image_processor.merge_size,
+        min_pixels = image_processor.size["shortest_edge"],
+        max_pixels = image_processor.size["longest_edge"],
+    )
+    image_transforms = T_v2.Compose([
+        # Note that the dlimp RandomResizedCrop used by the original RLDS dataloader
+        # seems to handle `ratio` differently: ratio is measured in normalized coordinates (between 0.0 and 1.0)
+        # hence ratio=(1.0, 1.0) would crop at the same aspect ratio as the original image
+        # (https://github.com/kvablack/dlimp/blob/5edaa4691567873d495633f2708982b42edf1972/dlimp/augmentations.py#L6)
+        # With torchvision to crop at the original aspect ratio, we need to pass the ratio of actual pixels
+        T_v2.RandomResizedCrop(size=resize_target, scale=(0.9, 0.9), ratio=(aspect_ratio, aspect_ratio)),
+        T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+    ])
     task_roots = [p for p in root.iterdir() if p.is_dir()]
     dataset = ConcatDataset([
         SkipEpisodesLeRobotDataset(
@@ -194,3 +200,29 @@ def load_dataset(
     dataset = PreprocessedDataset(dataset, preprocessor)
 
     return dataset
+
+def collate_with_observation_image_lists(
+    examples: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """
+    Collate function that collates `observation.images.*` fields as lists rather than tensors.
+
+    This allows for heterogeneous image shapes in the batch.
+    """
+    images = [
+        {k: v for k, v in example.items() if k.startswith('observation.images.')}
+        for example in examples
+    ]
+    collated_images = {
+        k: [observation[k] for observation in images]
+        for k in images[0].keys()
+    }
+    no_images = [
+        {k: v for k, v in example.items() if not k.startswith('observation.images.')}
+        for example in examples
+    ]
+    collated = {
+        **collated_images,
+        **default_collate(no_images)
+    }
+    return collated
