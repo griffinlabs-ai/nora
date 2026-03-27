@@ -367,6 +367,7 @@ def train(config: TrainingConfig):
         collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
         shuffle=True,
         num_workers=config.dataloader_num_workers,
+        pin_memory=True,
     )
 
     optimizer = torch.optim.AdamW(
