@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 from typing import Callable, Generic, Iterable, Mapping
 from scipy.interpolate import CubicSpline
 import torch
@@ -8,12 +9,12 @@ import pathlib
 import numpy as np
 import torchvision.transforms as T_v2
 from lerobot.configs.types import NormalizationMode
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 import lerobot.processor
 import lerobot.datasets.utils
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize, Qwen2VLImageProcessor
-from .skip_episodes_lerobot_dataset import SkipEpisodesLeRobotDataset
 
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
 
@@ -112,6 +113,22 @@ class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
         return features
 
 
+def load_lerobot_dataset_skip_dirty_episodes(
+    repo_id: str,
+    root: str | pathlib.Path | None = None,
+    episodes: list[int] | None = None,
+    *args,
+    **kwargs,
+) -> PreprocessedDataset:
+    if episodes is None and root is not None:
+        removed_episodes_path = pathlib.Path(root) / 'meta/removed_episodes.json'
+        if removed_episodes_path.exists():
+            total_episodes = lerobot.datasets.utils.load_info(root)['total_episodes']
+            with open(removed_episodes_path, 'r') as f:
+                removed_episodes = json.load(f)['dirty_episodes']
+            episodes = [i for i in range(total_episodes) if i not in removed_episodes]
+    return LeRobotDataset(repo_id, root, episodes, *args, **kwargs)
+
 def load_dataset(
     root: str,
     action_keys: Iterable[str],
@@ -156,7 +173,7 @@ def load_dataset(
     ])
     task_roots = [p for p in root.iterdir() if p.is_dir()]
     dataset = ConcatDataset([
-        SkipEpisodesLeRobotDataset(
+        load_lerobot_dataset_skip_dirty_episodes(
             task_root.name,
             root=task_root,
             delta_timestamps=delta_timestamps,
