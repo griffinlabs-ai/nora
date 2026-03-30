@@ -109,11 +109,12 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                 {
                     "role": "user",
                     "content": [
+                        {"type": "text", "text": f"[embodiment: {embodiment}]"},
                         *(
                             {"type": "image", "image": img}
-                            for img in imgs
+                            for img in imgs if img is not None
                         ),
-                        {"type": "text", "text": f"[embodiment: {embodiment}] {task}"},
+                        {"type": "text", "text": task},
                     ],
                 },
                 {
