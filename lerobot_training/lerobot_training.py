@@ -26,6 +26,8 @@ from lerobot.configs.types import  PipelineFeatureType
 import numpy as np
 from tqdm import tqdm
 
+import load_datasets
+
 from utils.data_loading import collate_with_observation_image_lists, load_dataset
 
 logger = get_logger(__name__)
@@ -54,145 +56,7 @@ class TrainingConfig:
     image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
     """Approximate target number of pixels in the resized image that the model receives."""
 
-# --- 2. Data Loading and Preprocessing ---
-def load_agibot_world_dataset(
-    root: str,
-    canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
-):
-    return load_dataset(
-        root,
-        ("actions.joint.position", "actions.effector.position"),
-        canonical_action_chunk_size,
-        canonical_action_chunk_size,
-        raw_fps = 30,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
-        aspect_ratio = 4/3,
-        instance_transform = agibot_world_to_nora_instance,
-        norm_stats_transform = lambda norm_stats: {
-            "action": {
-                "q01": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
-                "q99": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
-            }
-        },
-    )
-
-def load_galaxea_dataset(
-    root: str,
-    canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
-):
-    assert canonical_action_chunk_size % 2 == 0
-    return load_dataset(
-        root,
-        ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
-        canonical_action_chunk_size // 2,
-        canonical_action_chunk_size,
-        raw_fps = 15,
-        aspect_ratio = 16/9,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
-        instance_transform = galaxea_to_nora_instance,
-        norm_stats_transform = lambda norm_stats:
-            {
-                "action": {
-                    "q01": np.concatenate([
-                        norm_stats['action.left_arm']['q01'],
-                        np.array([-1.0, 0.0]),
-                        norm_stats['action.right_arm']['q01'],
-                        np.array([-1.0, 0.0]),
-                    ]),
-                    "q99": np.concatenate([
-                        norm_stats['action.left_arm']['q99'],
-                        np.array([1.0, 1.0]),
-                        norm_stats['action.right_arm']['q99'],
-                        np.array([1.0, 1.0]),
-                    ]),
-                }
-            },
-    )
-
-def agibot_world_to_nora_instance(batch: dict[str, Any]):
-    """
-    Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
-    - Merge relevant actions into `action`, discarding other actions.
-    - Merge relevant states into `observation.state`, discarding other states.
-    - Invert the gripper action by 1-x.
-    """
-    prev_dim_sizes = batch['actions.joint.position'].shape[:-1]
-    action = torch.cat(
-        [
-            batch['actions.joint.position'].view(*prev_dim_sizes, 2, 7),
-            1 - batch['actions.effector.position'].view(*prev_dim_sizes, 2, 1)
-        ],
-        dim = -1
-    ).view(*prev_dim_sizes, 16)
-    state = torch.cat(
-        [
-            batch['observation.states.joint.position'].view(2, 7),
-            # Effector position below is only used for its shape, the values should be unused through the
-            # delta transform mask. The values are in meters rather than [0, 1] so not actually comparable.
-            batch['observation.states.effector.position'].view(2, 1),
-        ],
-        dim = -1
-    ).view(16)
-    batch = {k: v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.states.')}
-    batch['action'] = action
-    batch['observation.state'] = state
-    batch['action_dim_is_pad'] = torch.zeros(action.shape[-1], dtype=torch.bool)
-    batch['info'] = {"embodiment_prompt": "AgiBot G1 with 2 grippers"}
-    return batch
-
-def galaxea_to_nora_instance(batch: dict[str, Any]):
-    """
-    Convert from raw Galaxea Open World Dataset format to format that is ready to be converted to `EnvTransition`:
-    - Merge relevant actions into `action`, discarding other actions.
-    - Merge relevant states into `observation.state`, discarding other states.
-    """
-    zero_padding = torch.zeros((*batch['action.left_arm'].shape[:-1], 1), dtype=batch['action.left_arm'].dtype)
-    action = torch.cat(
-        [
-            batch['action.left_arm'],
-            zero_padding,
-            batch['action.left_gripper'].unsqueeze(-1),
-            batch['action.right_arm'],
-            zero_padding,
-            batch['action.right_gripper'].unsqueeze(-1),
-        ],
-        dim = -1
-    )
-    zero_padding = torch.zeros((1,), dtype=batch['action.left_arm'].dtype)
-    state = torch.cat(
-        [
-            batch['observation.state.left_arm'],
-            zero_padding,
-            batch['observation.state.left_gripper'].unsqueeze(-1),
-            batch['observation.state.right_arm'],
-            zero_padding,
-            batch['observation.state.right_gripper'].unsqueeze(-1),
-        ],
-        dim = -1
-    )
-    batch = {k: v for k, v in batch.items() if not k.startswith('action.') and not k.startswith('observation.state.')}
-    batch['action'] = action
-    batch['observation.state'] = state
-    batch['action_dim_is_pad'] = torch.tensor(
-        [False, False, False, False, False, False, True, False] * 2,
-    )
-    batch['info'] = {"embodiment_prompt": "Galaxea R1 Lite"}
-    # rename image keys, drop right head image
-    batch['observation.images.head'] = batch['observation.images.head_rgb']
-    batch['observation.images.hand_left'] = batch['observation.images.left_wrist_rgb']
-    batch['observation.images.hand_right'] = batch['observation.images.right_wrist_rgb']
-    del batch['observation.images.head_rgb']
-    del batch['observation.images.head_right_rgb']
-    del batch['observation.images.left_wrist_rgb']
-    del batch['observation.images.right_wrist_rgb']
-    return batch
-
+# --- 2. Data Preprocessing ---
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
@@ -346,13 +210,13 @@ def train(config: TrainingConfig):
     model, transformer_processor = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
-        agibot_world = load_agibot_world_dataset(
+        agibot_world = load_datasets.load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
             image_target_pixels = config.image_target_pixels,
             image_processor = transformer_processor.image_processor,
         )
-        galaxea_open_world_ds = load_galaxea_dataset(
+        galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
             image_target_pixels = config.image_target_pixels,
