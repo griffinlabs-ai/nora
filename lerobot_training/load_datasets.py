@@ -198,8 +198,6 @@ def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
 def load_agibot_world_dataset(
     root: str,
     canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
 ):
     return load_dataset(
         root,
@@ -207,9 +205,6 @@ def load_agibot_world_dataset(
         canonical_action_chunk_size,
         canonical_action_chunk_size,
         raw_fps = 30,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
-        aspect_ratio = 4/3,
         instance_transform = agibot_world_to_nora_instance,
         norm_stats_transform = lambda norm_stats: {
             "action": {
@@ -222,8 +217,6 @@ def load_agibot_world_dataset(
 def load_galaxea_dataset(
     root: str,
     canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
 ):
     assert canonical_action_chunk_size % 2 == 0
     return load_dataset(
@@ -232,9 +225,6 @@ def load_galaxea_dataset(
         canonical_action_chunk_size // 2,
         canonical_action_chunk_size,
         raw_fps = 15,
-        aspect_ratio = 16/9,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
         instance_transform = galaxea_to_nora_instance,
         norm_stats_transform = lambda norm_stats:
             {
