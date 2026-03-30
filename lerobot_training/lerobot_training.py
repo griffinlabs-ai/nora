@@ -1,3 +1,4 @@
+from functools import lru_cache
 import sys
 import pathlib
 
@@ -13,17 +14,19 @@ from dataclasses import dataclass
 
 import torch
 from torch.utils.data import DataLoader
+import torchvision.transforms as T_v2
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
 from transformers import AutoProcessor
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.configs.types import  PipelineFeatureType
-import numpy as np
+
 from tqdm import tqdm
 
 import load_datasets
@@ -62,6 +65,54 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     return ''.join([f"<robot_action_{token}>" for token in tokens])
 
 @dataclass
+class NoraImageTransform:
+    target_pixels: int
+    patch_size: int
+    merge_size: int
+    min_pixels: int
+    max_pixels: int
+
+    def __post_init__(self):
+        self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+
+    @staticmethod
+    @lru_cache
+    def _get_random_resized_crop_transform(
+        target_pixels: int,
+        patch_size: int,
+        merge_size: int,
+        min_pixels: int,
+        max_pixels: int,
+        aspect_ratio: float,
+    ) -> T_v2.RandomResizedCrop:
+        resize_target = smart_resize(
+            (target_pixels / aspect_ratio)**0.5,
+            (target_pixels * aspect_ratio)**0.5,
+            factor = patch_size * merge_size,
+            min_pixels = min_pixels,
+            max_pixels = max_pixels,
+        )
+        return T_v2.RandomResizedCrop(
+            size=resize_target,
+            scale=(0.9, 0.9),
+            ratio=(aspect_ratio, aspect_ratio),
+        )
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        aspect_ratio = image.shape[-1] / image.shape[-2]
+        random_resized_crop_transform = self._get_random_resized_crop_transform(
+            self.target_pixels,
+            self.patch_size,
+            self.merge_size,
+            self.min_pixels,
+            self.max_pixels,
+            aspect_ratio,
+        )
+        image = random_resized_crop_transform(image)
+        image = self.color_jitter(image)
+        return image
+
+@dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
     # Added to accept Qwen3 config and processor
@@ -91,9 +142,24 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         else:
             raise ValueError("Action Tokens not found in the Qwen3 vocabulary! Please ensure they were injected during the model loading phase.")
 
+        self.nora_image_transform = NoraImageTransform(
+            target_pixels = self.config.image_target_pixels,
+            patch_size = self.transformer_processor.image_processor.patch_size,
+            merge_size = self.transformer_processor.image_processor.merge_size,
+            min_pixels = self.transformer_processor.image_processor.size["shortest_edge"],
+            max_pixels = self.transformer_processor.image_processor.size["longest_edge"],
+        )
+
     def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
-        # list of tuples, shape (batch_size, n_keys) where n_keys is the number of image keys
-        per_sample_images = list(zip(*(transition['observation'][k] for k in self.IMAGE_KEYS)))
+        # list of lists, shape (batch_size, n_keys) where n_keys is the number of image keys
+        per_sample_images = [
+            [
+                self.nora_image_transform(image) if image is not None else None
+                for image in images
+            ]
+            for images in zip(*(transition['observation'][k] for k in self.IMAGE_KEYS))
+        ]
+    
         fast_tokens = []
         for i in range(transition['action'].shape[0]):
             action = transition['action'][i]
@@ -214,14 +280,10 @@ def train(config: TrainingConfig):
         agibot_world = load_datasets.load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            image_target_pixels = config.image_target_pixels,
-            image_processor = transformer_processor.image_processor,
         )
         galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            image_target_pixels = config.image_target_pixels,
-            image_processor = transformer_processor.image_processor,
         )
         dataset = agibot_world + galaxea_open_world_ds
         policy_preprocessor = make_policy_processor(config, transformer_processor)
