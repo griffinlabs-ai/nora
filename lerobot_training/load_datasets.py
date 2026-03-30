@@ -1,3 +1,4 @@
+import functools
 from typing import Any, Iterable
 import torch
 from torch.utils.data import ConcatDataset
@@ -115,6 +116,83 @@ def galaxea_to_nora_instance(batch: dict[str, Any]):
     del batch['observation.images.head_right_rgb']
     del batch['observation.images.left_wrist_rgb']
     del batch['observation.images.right_wrist_rgb']
+    return batch
+
+def interndata_a1_to_nora_instance(
+    batch: dict[str, Any],
+    merge_spec: MergeSpec,
+    action_dim_is_pad: torch.Tensor,
+    embodiment_prompt: str,
+):
+    for key in batch:
+        if key.startswith('states.') and key.endswith('gripper.position'):
+            batch[key] = batch[key].view(-1)
+        elif key.startswith('actions.') and key.endswith('gripper.position'):
+            batch[key] = batch[key].view(-1, 1)
+
+    batch = generic_to_nora_instance(
+        batch,
+        merge_spec = merge_spec,
+        action_prefix = 'actions',
+        state_prefix = 'states',
+        action_dim_is_pad = action_dim_is_pad,
+        embodiment_prompt = embodiment_prompt,
+    )
+    batch = {k.replace('images.rgb.', 'observation.images.'): v for k, v in batch.items()}
+    return batch
+
+interndata_a1_genie1_to_nora_instance = functools.partial(
+    interndata_a1_to_nora_instance,
+    merge_spec = [
+        ('left_joint.position', slice(None)),
+        ('left_gripper.position', slice(None)),
+        ('right_joint.position', slice(None)),
+        ('right_gripper.position', slice(None)),
+    ],
+    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_7dof'],
+    embodiment_prompt = "InternData-A1 simulated Genie1 with 2 grippers",
+)
+interndata_a1_lift2_to_nora_instance = functools.partial(
+    interndata_a1_to_nora_instance,
+    merge_spec = [
+        ('left_joint.position', slice(None)),
+        (0.0, 1),
+        ('left_gripper.position', slice(None)),
+        ('right_joint.position', slice(None)),
+        (0.0, 1),
+        ('right_gripper.position', slice(None)),
+    ],
+    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
+    embodiment_prompt = "InternData-A1 simulated Lift-2 with R5a arms",
+)
+interndata_a1_split_aloha_to_nora_instance = functools.partial(
+    interndata_a1_to_nora_instance,
+    merge_spec = [
+        ('left_joint.position', slice(None)),
+        (0.0, 1),
+        ('left_gripper.position', slice(None)),
+        ('right_joint.position', slice(None)),
+        (0.0, 1),
+        ('right_gripper.position', slice(None)),
+    ],
+    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
+    embodiment_prompt = "InternData-A1 simulated Split Aloha with 2 Piper-100 arms",
+)
+
+def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
+    batch = interndata_a1_to_nora_instance(
+        batch,
+        merge_spec = [
+            ('joint.position', slice(None)),
+            ('gripper.position', slice(None)),
+            (0.0, 8),
+        ],
+        action_dim_is_pad = ACTION_DIM_IS_PAD['single_arm_7dof'],
+        embodiment_prompt = "InternData-A1 simulated Franka Emika Panda",
+    )
+    batch['observation.images.hand_left'] = batch['observation.images.hand']
+    batch['observation.images.hand_right'] = None
+    del batch['observation.images.hand']
     return batch
 
 def load_agibot_world_dataset(
