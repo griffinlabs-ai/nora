@@ -1,5 +1,8 @@
+from functools import lru_cache
 import sys
 import pathlib
+
+from torch.utils.data.dataset import ConcatDataset
 
 _root = pathlib.Path(__file__).resolve().parent.parent  # repo root
 if str(_root) not in sys.path:
@@ -13,18 +16,22 @@ from dataclasses import dataclass
 
 import torch
 from torch.utils.data import DataLoader
+import torchvision.transforms as T_v2
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
 from transformers import AutoProcessor
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.configs.types import  PipelineFeatureType
-import numpy as np
+
 from tqdm import tqdm
+
+import load_datasets
 
 from utils.data_loading import collate_with_observation_image_lists, load_dataset
 
@@ -41,8 +48,9 @@ class TrainingConfig:
     output_dir: str = './nora_finetune_object'
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
-    agibot_world_root: str = "data/agibot/tasks"
-    galaxea_open_world_ds_root: str = "data/galaxea/subsets"
+    agibot_world_root: str = "data/agibot-world/tasks"
+    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset/subsets"
+    interndata_a1_root: str = "data/interndata-a1/"
     wandb_project_name: str = "Nora VLA with LeRobotDataset"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
@@ -54,148 +62,58 @@ class TrainingConfig:
     image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
     """Approximate target number of pixels in the resized image that the model receives."""
 
-# --- 2. Data Loading and Preprocessing ---
-def load_agibot_world_dataset(
-    root: str,
-    canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
-):
-    return load_dataset(
-        root,
-        ("actions.joint.position", "actions.effector.position"),
-        canonical_action_chunk_size,
-        canonical_action_chunk_size,
-        raw_fps = 30,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
-        aspect_ratio = 4/3,
-        instance_transform = agibot_world_to_nora_instance,
-        norm_stats_transform = lambda norm_stats: {
-            "action": {
-                "q01": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
-                "q99": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
-            }
-        },
-    )
-
-def load_galaxea_dataset(
-    root: str,
-    canonical_action_chunk_size: int,
-    image_target_pixels: int,
-    image_processor,
-):
-    assert canonical_action_chunk_size % 2 == 0
-    return load_dataset(
-        root,
-        ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
-        canonical_action_chunk_size // 2,
-        canonical_action_chunk_size,
-        raw_fps = 15,
-        aspect_ratio = 16/9,
-        image_target_pixels = image_target_pixels,
-        image_processor = image_processor,
-        instance_transform = galaxea_to_nora_instance,
-        norm_stats_transform = lambda norm_stats:
-            {
-                "action": {
-                    "q01": np.concatenate([
-                        norm_stats['action.left_arm']['q01'],
-                        np.array([-1.0, 0.0]),
-                        norm_stats['action.right_arm']['q01'],
-                        np.array([-1.0, 0.0]),
-                    ]),
-                    "q99": np.concatenate([
-                        norm_stats['action.left_arm']['q99'],
-                        np.array([1.0, 1.0]),
-                        norm_stats['action.right_arm']['q99'],
-                        np.array([1.0, 1.0]),
-                    ]),
-                }
-            },
-    )
-
-def agibot_world_to_nora_instance(batch: dict[str, Any]):
-    """
-    Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
-    - Merge relevant actions into `action`, discarding other actions.
-    - Merge relevant states into `observation.state`, discarding other states.
-    - Invert the gripper action by 1-x.
-    """
-    prev_dim_sizes = batch['actions.joint.position'].shape[:-1]
-    action = torch.cat(
-        [
-            batch['actions.joint.position'].view(*prev_dim_sizes, 2, 7),
-            1 - batch['actions.effector.position'].view(*prev_dim_sizes, 2, 1)
-        ],
-        dim = -1
-    ).view(*prev_dim_sizes, 16)
-    state = torch.cat(
-        [
-            batch['observation.states.joint.position'].view(2, 7),
-            # Effector position below is only used for its shape, the values should be unused through the
-            # delta transform mask. The values are in meters rather than [0, 1] so not actually comparable.
-            batch['observation.states.effector.position'].view(2, 1),
-        ],
-        dim = -1
-    ).view(16)
-    batch = {k: v for k, v in batch.items() if not k.startswith('actions.') and not k.startswith('observation.states.')}
-    batch['action'] = action
-    batch['observation.state'] = state
-    batch['action_dim_is_pad'] = torch.zeros(action.shape[-1], dtype=torch.bool)
-    batch['info'] = {"embodiment_prompt": "AgiBot G1 with 2 grippers"}
-    return batch
-
-def galaxea_to_nora_instance(batch: dict[str, Any]):
-    """
-    Convert from raw Galaxea Open World Dataset format to format that is ready to be converted to `EnvTransition`:
-    - Merge relevant actions into `action`, discarding other actions.
-    - Merge relevant states into `observation.state`, discarding other states.
-    """
-    zero_padding = torch.zeros((*batch['action.left_arm'].shape[:-1], 1), dtype=batch['action.left_arm'].dtype)
-    action = torch.cat(
-        [
-            batch['action.left_arm'],
-            zero_padding,
-            batch['action.left_gripper'].unsqueeze(-1),
-            batch['action.right_arm'],
-            zero_padding,
-            batch['action.right_gripper'].unsqueeze(-1),
-        ],
-        dim = -1
-    )
-    zero_padding = torch.zeros((1,), dtype=batch['action.left_arm'].dtype)
-    state = torch.cat(
-        [
-            batch['observation.state.left_arm'],
-            zero_padding,
-            batch['observation.state.left_gripper'].unsqueeze(-1),
-            batch['observation.state.right_arm'],
-            zero_padding,
-            batch['observation.state.right_gripper'].unsqueeze(-1),
-        ],
-        dim = -1
-    )
-    batch = {k: v for k, v in batch.items() if not k.startswith('action.') and not k.startswith('observation.state.')}
-    batch['action'] = action
-    batch['observation.state'] = state
-    batch['action_dim_is_pad'] = torch.tensor(
-        [False, False, False, False, False, False, True, False] * 2,
-    )
-    batch['info'] = {"embodiment_prompt": "Galaxea R1 Lite"}
-    # rename image keys, drop right head image
-    batch['observation.images.head'] = batch['observation.images.head_rgb']
-    batch['observation.images.hand_left'] = batch['observation.images.left_wrist_rgb']
-    batch['observation.images.hand_right'] = batch['observation.images.right_wrist_rgb']
-    del batch['observation.images.head_rgb']
-    del batch['observation.images.head_right_rgb']
-    del batch['observation.images.left_wrist_rgb']
-    del batch['observation.images.right_wrist_rgb']
-    return batch
-
+# --- 2. Data Preprocessing ---
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
+
+@dataclass
+class NoraImageTransform:
+    target_pixels: int
+    patch_size: int
+    merge_size: int
+    min_pixels: int
+    max_pixels: int
+
+    def __post_init__(self):
+        self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+
+    @staticmethod
+    @lru_cache
+    def _get_random_resized_crop_transform(
+        target_pixels: int,
+        patch_size: int,
+        merge_size: int,
+        min_pixels: int,
+        max_pixels: int,
+        aspect_ratio: float,
+    ) -> T_v2.RandomResizedCrop:
+        resize_target = smart_resize(
+            (target_pixels / aspect_ratio)**0.5,
+            (target_pixels * aspect_ratio)**0.5,
+            factor = patch_size * merge_size,
+            min_pixels = min_pixels,
+            max_pixels = max_pixels,
+        )
+        return T_v2.RandomResizedCrop(
+            size=resize_target,
+            scale=(0.9, 0.9),
+            ratio=(aspect_ratio, aspect_ratio),
+        )
+
+    def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        aspect_ratio = image.shape[-1] / image.shape[-2]
+        random_resized_crop_transform = self._get_random_resized_crop_transform(
+            self.target_pixels,
+            self.patch_size,
+            self.merge_size,
+            self.min_pixels,
+            self.max_pixels,
+            aspect_ratio,
+        )
+        image = random_resized_crop_transform(image)
+        image = self.color_jitter(image)
+        return image
 
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
@@ -227,9 +145,24 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         else:
             raise ValueError("Action Tokens not found in the Qwen3 vocabulary! Please ensure they were injected during the model loading phase.")
 
+        self.nora_image_transform = NoraImageTransform(
+            target_pixels = self.config.image_target_pixels,
+            patch_size = self.transformer_processor.image_processor.patch_size,
+            merge_size = self.transformer_processor.image_processor.merge_size,
+            min_pixels = self.transformer_processor.image_processor.size["shortest_edge"],
+            max_pixels = self.transformer_processor.image_processor.size["longest_edge"],
+        )
+
     def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
-        # list of tuples, shape (batch_size, n_keys) where n_keys is the number of image keys
-        per_sample_images = list(zip(*(transition['observation'][k] for k in self.IMAGE_KEYS)))
+        # list of lists, shape (batch_size, n_keys) where n_keys is the number of image keys
+        per_sample_images = [
+            [
+                self.nora_image_transform(image) if image is not None else None
+                for image in images
+            ]
+            for images in zip(*(transition['observation'][k] for k in self.IMAGE_KEYS))
+        ]
+    
         fast_tokens = []
         for i in range(transition['action'].shape[0]):
             action = transition['action'][i]
@@ -245,11 +178,12 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
                 {
                     "role": "user",
                     "content": [
+                        {"type": "text", "text": f"[embodiment: {embodiment}]"},
                         *(
                             {"type": "image", "image": img}
-                            for img in imgs
+                            for img in imgs if img is not None
                         ),
-                        {"type": "text", "text": f"[embodiment: {embodiment}] {task}"},
+                        {"type": "text", "text": task},
                     ],
                 },
                 {
@@ -346,19 +280,19 @@ def train(config: TrainingConfig):
     model, transformer_processor = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
-        agibot_world = load_agibot_world_dataset(
+        agibot_world = load_datasets.load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            image_target_pixels = config.image_target_pixels,
-            image_processor = transformer_processor.image_processor,
         )
-        galaxea_open_world_ds = load_galaxea_dataset(
+        galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            image_target_pixels = config.image_target_pixels,
-            image_processor = transformer_processor.image_processor,
         )
-        dataset = agibot_world + galaxea_open_world_ds
+        interndata_a1 = load_datasets.load_interndata_a1_dataset(
+            root = config.interndata_a1_root,
+            canonical_action_chunk_size = config.action_chunk_size,
+        )
+        dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
         policy_preprocessor = make_policy_processor(config, transformer_processor)
 
     train_dataloader = DataLoader(
