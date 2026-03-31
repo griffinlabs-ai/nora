@@ -2,6 +2,8 @@ from functools import lru_cache
 import sys
 import pathlib
 
+from torch.utils.data.dataset import ConcatDataset
+
 _root = pathlib.Path(__file__).resolve().parent.parent  # repo root
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
@@ -46,8 +48,9 @@ class TrainingConfig:
     output_dir: str = './nora_finetune_object'
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
-    agibot_world_root: str = "data/agibot/tasks"
-    galaxea_open_world_ds_root: str = "data/galaxea/subsets"
+    agibot_world_root: str = "data/agibot-world/tasks"
+    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset/subsets"
+    interndata_a1_root: str = "data/interndata-a1/"
     wandb_project_name: str = "Nora VLA with LeRobotDataset"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
@@ -285,7 +288,11 @@ def train(config: TrainingConfig):
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
         )
-        dataset = agibot_world + galaxea_open_world_ds
+        interndata_a1 = load_datasets.load_interndata_a1_dataset(
+            root = config.interndata_a1_root,
+            canonical_action_chunk_size = config.action_chunk_size,
+        )
+        dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
         policy_preprocessor = make_policy_processor(config, transformer_processor)
 
     train_dataloader = DataLoader(
