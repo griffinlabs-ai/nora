@@ -1,4 +1,5 @@
 import functools
+import pathlib
 from typing import Any, Iterable
 import torch
 from torch.utils.data import ConcatDataset
@@ -231,16 +232,108 @@ def load_galaxea_dataset(
                 "action": {
                     "q01": np.concatenate([
                         norm_stats['action.left_arm']['q01'],
-                        np.array([-1.0, 0.0]),
+                        np.array([0.0, 0.0]),
                         norm_stats['action.right_arm']['q01'],
-                        np.array([-1.0, 0.0]),
+                        np.array([0.0, 0.0]),
                     ]),
                     "q99": np.concatenate([
                         norm_stats['action.left_arm']['q99'],
-                        np.array([1.0, 1.0]),
+                        np.array([0.0, 1.0]),
                         norm_stats['action.right_arm']['q99'],
-                        np.array([1.0, 1.0]),
+                        np.array([0.0, 1.0]),
                     ]),
                 }
             },
     )
+
+def load_interndata_a1_dataset(
+    root: str | pathlib.Path,
+    canonical_action_chunk_size: int,
+):
+    root = pathlib.Path(root)
+
+    franka_dataset = load_dataset(
+        root / 'franka',
+        ("actions.joint.position", "actions.gripper.position"),
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        raw_fps = 30,
+        instance_transform = interndata_a1_franka_to_nora_instance,
+        norm_stats_transform = lambda norm_stats: {
+            "action": {
+                "q01": np.concatenate([
+                    norm_stats['actions.joint.position']['q01'],
+                    np.array([0.0] * 9),
+                ]),
+                "q99": np.concatenate([
+                    norm_stats['actions.joint.position']['q99'],
+                    np.array([1.0] * 9),
+                ]),
+            }
+        },
+    )
+    dual_arm_action_keys = (
+        "actions.left_joint.position",
+        "actions.left_gripper.position",
+        "actions.right_joint.position",
+        "actions.right_gripper.position",
+    )
+    genie1_dataset = load_dataset(
+        root / 'genie1',
+        dual_arm_action_keys,
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        raw_fps = 30,
+        instance_transform = interndata_a1_genie1_to_nora_instance,
+        norm_stats_transform = lambda norm_stats: {
+            "action": {
+                "q01": np.concatenate([
+                    norm_stats['actions.left_joint.position']['q01'],
+                    np.array([0.0]),
+                    norm_stats['actions.right_joint.position']['q01'],
+                    np.array([0.0]),
+                ]),
+                "q99": np.concatenate([
+                    norm_stats['actions.left_joint.position']['q99'],
+                    np.array([1.0]),
+                    norm_stats['actions.right_joint.position']['q99'],
+                    np.array([1.0]),
+                ]),
+            }
+        },
+    )
+    dual_arm_6dof_norm_stats_transform = lambda norm_stats: {
+        "action": {
+            "q01": np.concatenate([
+                norm_stats['actions.left_joint.position']['q01'],
+                np.array([0.0, 0.0]),
+                norm_stats['actions.right_joint.position']['q01'],
+                np.array([0.0, 0.0]),
+            ]),
+            "q99": np.concatenate([
+                norm_stats['actions.left_joint.position']['q99'],
+                np.array([0.0, 1.0]),
+                norm_stats['actions.right_joint.position']['q99'],
+                np.array([0.0, 1.0]),
+            ]),
+        }
+    }
+    lift2_dataset = load_dataset(
+        root / 'lift2',
+        dual_arm_action_keys,
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        raw_fps = 30,
+        instance_transform = interndata_a1_lift2_to_nora_instance,
+        norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+    )
+    split_aloha_dataset = load_dataset(
+        root / 'split_aloha',
+        dual_arm_action_keys,
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        raw_fps = 30,
+        instance_transform = interndata_a1_split_aloha_to_nora_instance,
+        norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+    )
+    return ConcatDataset([franka_dataset, genie1_dataset, lift2_dataset, split_aloha_dataset])
