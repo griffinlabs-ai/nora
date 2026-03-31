@@ -128,7 +128,7 @@ def load_lerobot_dataset_skip_dirty_episodes(
     return LeRobotDataset(repo_id, root, episodes, *args, **kwargs)
 
 def load_dataset(
-    root: str,
+    root: str | pathlib.Path,
     action_keys: Iterable[str],
     load_action_chunk_size: int,
     canonical_action_chunk_size: int,
@@ -150,10 +150,10 @@ def load_dataset(
         action_key: delta_timestamps
         for action_key in action_keys
     }
-    task_roots = [p for p in root.iterdir() if p.is_dir()]
+    task_roots = [p.parent.parent for p in root.rglob('info.json')]
     dataset = ConcatDataset([
         load_lerobot_dataset_skip_dirty_episodes(
-            task_root.name,
+            task_root.relative_to(root),
             root=task_root,
             delta_timestamps=delta_timestamps,
         )
