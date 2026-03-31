@@ -8,7 +8,7 @@ from typing import Any
 import pathlib
 import numpy as np
 from lerobot.configs.types import NormalizationMode
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import lerobot.processor
 import lerobot.datasets.utils
 from torch.utils.data import ConcatDataset
@@ -135,6 +135,7 @@ def load_dataset(
     raw_fps: int,
     instance_transform: Callable[[dict[str, Any]], dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
+    num_frames: int = 1, 
 ) -> PreprocessedDataset:
     """
     Loads preprocessed dataset. The following preprocessing steps are applied:
@@ -145,24 +146,46 @@ def load_dataset(
     """
     root = pathlib.Path(root)
 
-    delta_timestamps = [i / raw_fps for i in range(load_action_chunk_size)]
+    # 1. Action timestamps (Future prediction chunk)
+    action_delta_timestamps = [i / raw_fps for i in range(load_action_chunk_size)]
     delta_timestamps = {
-        action_key: delta_timestamps
+        action_key: action_delta_timestamps
         for action_key in action_keys
     }
+    
     task_roots = [p.parent.parent for p in root.rglob('info.json')]
+
+    # 2. Image timestamps (Past observation history)
+    # We dynamically find the image keys from the first dataset to apply history frames
+    if task_roots and num_frames > 1:
+        
+        repo_id = str(task_roots[0].relative_to(root))
+        meta = LeRobotDatasetMetadata(repo_id, root=task_roots[0])
+        
+        # Find all keys that represent images
+        image_keys = [k for k in meta.features.keys() if 'image' in k.lower()]
+        
+        # Calculate timestamps for 5 past frames + 1 current frame
+        img_timestamps = [float(i - num_frames + 1) for i in range(num_frames)]
+        
+        # Apply the temporal window to all image streams
+        for img_k in image_keys:
+            delta_timestamps[img_k] = img_timestamps
+
     dataset = ConcatDataset([
         load_lerobot_dataset_skip_dirty_episodes(
             task_root.relative_to(root),
             root=task_root,
-            delta_timestamps=delta_timestamps,
+            delta_timestamps=delta_timestamps, 
         )
         for task_root in tqdm(task_roots, desc="Loading datasets")
     ])
+    
     # Load and prepare normalization stats
     raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
         lerobot.datasets.utils.load_json(root / 'delta_norm_stats.json')
     )['norm_stats']
+    
     # gripper min and max are currently hardcoded to 0 and 1.
     # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
     # so the stats would have to be transformed as well, and order reversed (e.g. q01 becomes 1-q99)
@@ -171,9 +194,11 @@ def load_dataset(
     norm_map = {
         'ACTION': NormalizationMode.QUANTILES,
     }
+    
     resample_step_if_necessary = [ResampleActionProcessorStep(
         target_chunk_size = canonical_action_chunk_size,
     )] if load_action_chunk_size != canonical_action_chunk_size else []
+    
     preprocessor = PolicyProcessorPipeline(
         steps = [
             Abs2DeltaActionProcessorStep(

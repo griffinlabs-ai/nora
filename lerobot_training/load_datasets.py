@@ -199,6 +199,7 @@ def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
 def load_agibot_world_dataset(
     root: str,
     canonical_action_chunk_size: int,
+    num_frames: int = 1,
 ):
     return load_dataset(
         root,
@@ -213,11 +214,13 @@ def load_agibot_world_dataset(
                 "q99": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
             }
         },
+        num_frames = num_frames
     )
 
 def load_galaxea_dataset(
     root: str,
     canonical_action_chunk_size: int,
+    num_frames: int = 1,
 ):
     assert canonical_action_chunk_size % 2 == 0
     return load_dataset(
@@ -244,11 +247,13 @@ def load_galaxea_dataset(
                     ]),
                 }
             },
+        num_frames = num_frames
     )
 
 def load_interndata_a1_dataset(
     root: str | pathlib.Path,
     canonical_action_chunk_size: int,
+    num_frames: int = 1,
 ):
     root = pathlib.Path(root)
 
@@ -271,6 +276,7 @@ def load_interndata_a1_dataset(
                 ]),
             }
         },
+        num_frames = num_frames
     )
     dual_arm_action_keys = (
         "actions.left_joint.position",
@@ -301,6 +307,7 @@ def load_interndata_a1_dataset(
                 ]),
             }
         },
+        num_frames = num_frames
     )
     dual_arm_6dof_norm_stats_transform = lambda norm_stats: {
         "action": {
@@ -326,6 +333,7 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_lift2_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+        num_frames = num_frames
     )
     split_aloha_dataset = load_dataset(
         root / 'split_aloha',
@@ -335,5 +343,6 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_split_aloha_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+        num_frames = num_frames
     )
     return ConcatDataset([franka_dataset, genie1_dataset, lift2_dataset, split_aloha_dataset])
