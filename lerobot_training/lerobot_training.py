@@ -27,13 +27,14 @@ from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers import get_scheduler
 
 import lerobot.processor
-from lerobot.configs.types import  PipelineFeatureType
-
+from lerobot.configs.types import PipelineFeatureType
+from qwen_vl_utils import process_vision_info
+import numpy as np
 from tqdm import tqdm
 
 import load_datasets
-
 from utils.data_loading import collate_with_observation_image_lists, load_dataset
+import lerobot.processor.converters
 
 logger = get_logger(__name__)
 
@@ -61,8 +62,12 @@ class TrainingConfig:
     action_vocab_size: int = 2048
     image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
     """Approximate target number of pixels in the resized image that the model receives."""
+    
+    # Number of frames to input (5 past + 1 current = 6)
+    num_frames: int = 6
 
-# --- 2. Data Preprocessing ---
+
+# --- 2. Data Preprocessing & Transforms ---
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
@@ -115,10 +120,10 @@ class NoraImageTransform:
         image = self.color_jitter(image)
         return image
 
+
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
-    # Added to accept Qwen3 config and processor
     config: TrainingConfig 
     transformer_processor: Any 
     action_token_min: int = -1
@@ -134,7 +139,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
-        # Dynamically calculate Action Token range to replace the original hardcoded values (151665 ~ 153712)
+        # Dynamically calculate Action Token range
         action_tokens = [f"<robot_action_{i}>" for i in range(self.config.action_vocab_size)]
         action_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(action_tokens)
         action_ids = [id for id in action_ids if id is not None and id != self.transformer_processor.tokenizer.unk_token_id]
@@ -143,7 +148,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             self.action_token_min = min(action_ids)
             self.action_token_max = max(action_ids)
         else:
-            raise ValueError("Action Tokens not found in the Qwen3 vocabulary! Please ensure they were injected during the model loading phase.")
+            raise ValueError("Action Tokens not found in the Qwen3 vocabulary!")
 
         self.nora_image_transform = NoraImageTransform(
             target_pixels = self.config.image_target_pixels,
@@ -153,18 +158,31 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             max_pixels = self.transformer_processor.image_processor.size["longest_edge"],
         )
 
-    def __call__(self, transition: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
-        # list of lists, shape (batch_size, n_keys) where n_keys is the number of image keys
-        per_sample_images = [
-            [
-                self.nora_image_transform(image) if image is not None else None
-                for image in images
-            ]
-            for images in zip(*(transition['observation'][k] for k in self.IMAGE_KEYS))
-        ]
-    
+    def __call__(self, transition) -> lerobot.processor.EnvTransition:
+        batch_size = transition['action'].shape[0]
+        per_sample_images = []
+        
+        obs_dict = transition['observation'] if 'observation' in transition else transition
+        
+        for i in range(batch_size):
+            imgs_for_this_sample = []
+            
+            first_cam = obs_dict[self.IMAGE_KEYS[0]][i]
+            T = first_cam.shape[0] if first_cam.dim() == 4 else 1
+            
+            # Temporal loop: Extract historical frames and apply the latest Transform.
+            for t in range(T):
+                for k in self.IMAGE_KEYS:
+                    img_tensor = obs_dict[k][i]
+                    frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
+                    
+                    transformed_frame = self.nora_image_transform(frame) if frame is not None else None
+                    imgs_for_this_sample.append(transformed_frame)
+            
+            per_sample_images.append(imgs_for_this_sample)
+
         fast_tokens = []
-        for i in range(transition['action'].shape[0]):
+        for i in range(batch_size):
             action = transition['action'][i]
             action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
             fast_tokens.extend(self.fast_tokenizer(action.cpu()))
@@ -229,8 +247,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             PipelineFeatureType.OBSERVATION: {},
         }
 
+
 def make_policy_processor(config: TrainingConfig, transformer_processor: Any) -> lerobot.processor.PolicyProcessorPipeline:
-    # Pass config and processor to the step
     return lerobot.processor.PolicyProcessorPipeline(
         steps = [NoraPolicyProcessorStep(config=config, transformer_processor=transformer_processor)],
         to_output=lambda tr: tr['complementary_data'],
@@ -267,6 +285,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 
     return model, transformer_processor
 
+
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
@@ -276,21 +295,23 @@ def train(config: TrainingConfig):
 
     accelerator.init_trackers(config.wandb_project_name, config=config)
 
-    # Unpack both model and processor
     model, transformer_processor = load_model_and_processor(config, accelerator)
 
     with accelerator.main_process_first():
         agibot_world = load_datasets.load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
+            num_frames = config.num_frames, 
         )
         galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
+            num_frames = config.num_frames, 
         )
         interndata_a1 = load_datasets.load_interndata_a1_dataset(
             root = config.interndata_a1_root,
             canonical_action_chunk_size = config.action_chunk_size,
+            num_frames = config.num_frames, 
         )
         dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
         policy_preprocessor = make_policy_processor(config, transformer_processor)
@@ -348,7 +369,6 @@ def train(config: TrainingConfig):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 
-                # Filter dictionary keys to prevent unexpected kwargs to Qwen3
                 model_inputs = {
                     'input_ids': batch['input_ids'],
                     'attention_mask': batch['attention_mask'],
