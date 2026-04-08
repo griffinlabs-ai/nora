@@ -305,13 +305,11 @@ def train(config: TrainingConfig):
         agibot_world = load_datasets.load_agibot_world_dataset(
             root = config.agibot_world_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            use_image_augmentation = config.image_augmentation, # [Resolved from refactor branch]
             num_frames = config.num_frames, 
         )
         galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
             root = config.galaxea_open_world_ds_root,
             canonical_action_chunk_size = config.action_chunk_size,
-            use_image_augmentation = config.image_augmentation, # [Resolved from refactor branch]
             num_frames = config.num_frames, 
         )
         interndata_a1 = load_datasets.load_interndata_a1_dataset(
@@ -342,7 +340,6 @@ def train(config: TrainingConfig):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
-
     max_train_steps = len(train_dataloader) * config.max_epochs
     max_optim_steps = math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs
     lr_scheduler = get_scheduler(
