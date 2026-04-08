@@ -1,6 +1,7 @@
 from functools import lru_cache
 import sys
 import pathlib
+import traceback
 
 from torch.utils.data.dataset import ConcatDataset
 
@@ -11,7 +12,7 @@ if str(_root) not in sys.path:
 import math
 import os
 import logging
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Tuple
 from dataclasses import dataclass
 
 import torch
@@ -21,14 +22,12 @@ import torchvision.transforms as T_v2
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 
-from transformers import AutoProcessor
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
-from transformers import get_scheduler
+# Use dynamic import to support different transformers versions for VLM base classes
+from transformers import AutoProcessor, get_scheduler
+from transformers import AutoModelForImageTextToText as AutoModelClass
 
 import lerobot.processor
 from lerobot.configs.types import PipelineFeatureType
-from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
 
@@ -58,13 +57,19 @@ class TrainingConfig:
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 4
     action_chunk_size: int = 50
-    model_id: str = "Qwen/Qwen3-VL-4B-Instruct" 
+    
+    # Updated to use Gemma-4 E4B
+    model_id: str = "google/gemma-4-E4B-it" 
     action_vocab_size: int = 2048
-    image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
-    """Approximate target number of pixels in the resized image that the model receives."""
+    
+    # Standard vision target size
+    image_target_size: Tuple[int, int] = (224, 224) 
     
     # Number of frames to input (5 past + 1 current = 6)
     num_frames: int = 6
+    
+    # [Resolved from refactor branch] Flag for image augmentation
+    image_augmentation: bool = False
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -74,49 +79,18 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
 
 @dataclass
 class NoraImageTransform:
-    target_pixels: int
-    patch_size: int
-    merge_size: int
-    min_pixels: int
-    max_pixels: int
+    target_size: Tuple[int, int]
 
     def __post_init__(self):
         self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-
-    @staticmethod
-    @lru_cache
-    def _get_random_resized_crop_transform(
-        target_pixels: int,
-        patch_size: int,
-        merge_size: int,
-        min_pixels: int,
-        max_pixels: int,
-        aspect_ratio: float,
-    ) -> T_v2.RandomResizedCrop:
-        resize_target = smart_resize(
-            (target_pixels / aspect_ratio)**0.5,
-            (target_pixels * aspect_ratio)**0.5,
-            factor = patch_size * merge_size,
-            min_pixels = min_pixels,
-            max_pixels = max_pixels,
-        )
-        return T_v2.RandomResizedCrop(
-            size=resize_target,
-            scale=(0.9, 0.9),
-            ratio=(aspect_ratio, aspect_ratio),
+        self.crop_transform = T_v2.RandomResizedCrop(
+            size=self.target_size,
+            scale=(0.9, 1.0),
+            ratio=(0.9, 1.1),
         )
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        aspect_ratio = image.shape[-1] / image.shape[-2]
-        random_resized_crop_transform = self._get_random_resized_crop_transform(
-            self.target_pixels,
-            self.patch_size,
-            self.merge_size,
-            self.min_pixels,
-            self.max_pixels,
-            aspect_ratio,
-        )
-        image = random_resized_crop_transform(image)
+        image = self.crop_transform(image)
         image = self.color_jitter(image)
         return image
 
@@ -139,6 +113,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
             "physical-intelligence/fast", trust_remote_code=True
         )
+        
         # Dynamically calculate Action Token range
         action_tokens = [f"<robot_action_{i}>" for i in range(self.config.action_vocab_size)]
         action_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(action_tokens)
@@ -148,84 +123,74 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             self.action_token_min = min(action_ids)
             self.action_token_max = max(action_ids)
         else:
-            raise ValueError("Action Tokens not found in the Qwen3 vocabulary!")
+            raise ValueError("Action Tokens not found in the Gemma vocabulary!")
 
         self.nora_image_transform = NoraImageTransform(
-            target_pixels = self.config.image_target_pixels,
-            patch_size = self.transformer_processor.image_processor.patch_size,
-            merge_size = self.transformer_processor.image_processor.merge_size,
-            min_pixels = self.transformer_processor.image_processor.size["shortest_edge"],
-            max_pixels = self.transformer_processor.image_processor.size["longest_edge"],
+            target_size = self.config.image_target_size
         )
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
         batch_size = transition['action'].shape[0]
-        per_sample_images = []
-        
         obs_dict = transition['observation'] if 'observation' in transition else transition
         
+        text_prompts = []
+        batch_images = []
+        
+        # 1. Process images and construct text prompts
         for i in range(batch_size):
             imgs_for_this_sample = []
             
             first_cam = obs_dict[self.IMAGE_KEYS[0]][i]
             T = first_cam.shape[0] if first_cam.dim() == 4 else 1
             
-            # Temporal loop: Extract historical frames and apply the latest Transform.
+            # Extract historical frames and apply Transform
             for t in range(T):
                 for k in self.IMAGE_KEYS:
                     img_tensor = obs_dict[k][i]
                     frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
-                    
                     transformed_frame = self.nora_image_transform(frame) if frame is not None else None
-                    imgs_for_this_sample.append(transformed_frame)
+                    if transformed_frame is not None:
+                        imgs_for_this_sample.append(transformed_frame)
             
-            per_sample_images.append(imgs_for_this_sample)
+            batch_images.append(imgs_for_this_sample)
 
-        fast_tokens = []
-        for i in range(batch_size):
+            # 2. Extract Action Tokens
             action = transition['action'][i]
             action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
-            fast_tokens.extend(self.fast_tokenizer(action.cpu()))
+            fast_tokens = self.fast_tokenizer(action.cpu())
+            vlm_action = map_fast_token_to_vlm_action(fast_tokens)
+            
+            task = transition['complementary_data']['task'][i]
+            embodiment = transition['info']['embodiment_prompt'][i]
 
-        vlm_action = [map_fast_token_to_vlm_action(ft) for ft in fast_tokens]
-        tasks = transition['complementary_data']['task']
-        embodiment_prompts = transition['info']['embodiment_prompt']
+            # 3. Construct the message with image placeholders ONLY
+            content = [{"type": "text", "text": f"[embodiment: {embodiment}]\n"}]
+            for _ in imgs_for_this_sample:
+                content.append({"type": "image"})
+            content.append({"type": "text", "text": task})
 
-        messages = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"[embodiment: {embodiment}]"},
-                        *(
-                            {"type": "image", "image": img}
-                            for img in imgs if img is not None
-                        ),
-                        {"type": "text", "text": task},
-                    ],
-                },
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": act},
-                    ],
-                }
+            messages = [
+                {"role": "user", "content": content},
+                {"role": "assistant", "content": [{"type": "text", "text": vlm_action}]}
             ]
-            for imgs, task, embodiment, act in zip(per_sample_images, tasks, embodiment_prompts, vlm_action)
-        ]
+            
+            # Get purely textual prompt with <image> placeholders
+            prompt = self.transformer_processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            text_prompts.append(prompt)
 
-        batch_input = self.transformer_processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=False,
-            return_dict=True,
+        # 4. Pass separated text and images into the processor
+        batch_input = self.transformer_processor(
+            text=text_prompts,
+            images=batch_images,
             padding=True,
             return_tensors="pt",
         )
         
         labels = batch_input['input_ids'].clone()
 
-        # Use dynamically calculated action_token_min/max
+        # Mask out everything before the action tokens to calculate loss only on actions
         for i in range(labels.size(0)):
             seq = labels[i]
             mask_seq = (seq >= self.action_token_min) & (seq <= self.action_token_max)
@@ -236,7 +201,11 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             else:
                 seq[:] = -100
 
-        labels[labels == self.transformer_processor.tokenizer.pad_token_id] = -100
+        # Mask out padding tokens
+        pad_token_id = self.transformer_processor.tokenizer.pad_token_id
+        if pad_token_id is not None:
+            labels[labels == pad_token_id] = -100
+            
         batch_input['labels'] = labels
 
         return lerobot.processor.create_transition(complementary_data = batch_input)
@@ -247,7 +216,6 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             PipelineFeatureType.OBSERVATION: {},
         }
 
-
 def make_policy_processor(config: TrainingConfig, transformer_processor: Any) -> lerobot.processor.PolicyProcessorPipeline:
     return lerobot.processor.PolicyProcessorPipeline(
         steps = [NoraPolicyProcessorStep(config=config, transformer_processor=transformer_processor)],
@@ -257,22 +225,58 @@ def make_policy_processor(config: TrainingConfig, transformer_processor: Any) ->
 
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
-    """Loads Qwen3, its processor, and injects action tokens."""
+    """Loads Gemma-4, its processor, injects action tokens, and applies embedding hotfix."""
     transformer_processor = AutoProcessor.from_pretrained(config.model_id, trust_remote_code=True)
+    
+    # Ensure pad token exists
+    if transformer_processor.tokenizer.pad_token is None:
+        transformer_processor.tokenizer.pad_token = transformer_processor.tokenizer.eos_token
     transformer_processor.tokenizer.padding_side = 'left'
 
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        config.model_id,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
-        trust_remote_code=True
-    )
-
+    old_vocab_size = len(transformer_processor.tokenizer)
+    
     # Inject action tokens
     action_tokens = [f"<robot_action_{i}>" for i in range(config.action_vocab_size)]
     transformer_processor.tokenizer.add_tokens(action_tokens, special_tokens=True)
-    model.resize_token_embeddings(len(transformer_processor.tokenizer))
-    accelerator.print(f"Added {len(action_tokens)} action tokens to Qwen3 vocabulary.")
+    new_vocab_size = len(transformer_processor.tokenizer)
+    
+    accelerator.print(f"Added {len(action_tokens)} action tokens to Gemma-4 vocabulary.")
+    accelerator.print(f"Vocab size resized: {old_vocab_size} -> {new_vocab_size}")
+
+    model = AutoModelClass.from_pretrained(
+        config.model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+
+    # Standard API resizing
+    model.resize_token_embeddings(new_vocab_size)
+    if hasattr(model, 'config'):
+        model.config.vocab_size = new_vocab_size
+
+    # =====================================================================
+    # [HOTFIX] Scan and force resize nested embedding layers missed by API
+    # =====================================================================
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Embedding) and module.num_embeddings == old_vocab_size:
+            accelerator.print(f"-> Hotfix: Resizing nested layer {name} from {old_vocab_size} to {new_vocab_size}")
+            
+            old_weight = module.weight.data
+            new_weight = torch.empty((new_vocab_size, module.embedding_dim), 
+                                     dtype=old_weight.dtype, 
+                                     device=old_weight.device)
+            new_weight[:old_vocab_size, :] = old_weight
+            
+            mean = old_weight.mean(dim=0)
+            std = old_weight.std(dim=0)
+            new_weight[old_vocab_size:, :] = torch.normal(
+                mean.expand(new_vocab_size - old_vocab_size, -1), 
+                std.expand(new_vocab_size - old_vocab_size, -1)
+            )
+            
+            module.num_embeddings = new_vocab_size
+            module.weight = torch.nn.Parameter(new_weight)
+    # =====================================================================
 
     if config.load_model_weights:
         tensors = {}
@@ -289,7 +293,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
-    accelerator = Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps,log_with="wandb")
+    accelerator = Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps, log_with="wandb")
     accelerator.dataloader_config.dispatch_batches = False
     logger.info(accelerator.state, main_process_only=False)
 
@@ -336,7 +340,6 @@ def train(config: TrainingConfig):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
-
     max_train_steps = len(train_dataloader) * config.max_epochs
     max_optim_steps = math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs
     lr_scheduler = get_scheduler(
@@ -372,10 +375,13 @@ def train(config: TrainingConfig):
                 model_inputs = {
                     'input_ids': batch['input_ids'],
                     'attention_mask': batch['attention_mask'],
-                    'pixel_values': batch['pixel_values'],
-                    'image_grid_thw': batch['image_grid_thw'],
                     'labels': batch['labels']
                 }
+                
+                if 'pixel_values' in batch:
+                    model_inputs['pixel_values'] = batch['pixel_values']
+                if 'pixel_attention_mask' in batch:
+                    model_inputs['pixel_attention_mask'] = batch['pixel_attention_mask']
                 
                 outputs = model(**model_inputs)
                 loss = outputs.loss
