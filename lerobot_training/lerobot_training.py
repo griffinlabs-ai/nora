@@ -147,9 +147,9 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             for t in range(T):
                 for k in self.IMAGE_KEYS:
                     img_tensor = obs_dict[k][i]
-                    frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
-                    transformed_frame = self.nora_image_transform(frame) if frame is not None else None
-                    if transformed_frame is not None:
+                    if img_tensor is not None:
+                        frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
+                        transformed_frame = self.nora_image_transform(frame)
                         imgs_for_this_sample.append(transformed_frame)
             
             batch_images.append(imgs_for_this_sample)
@@ -157,7 +157,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             # 2. Extract Action Tokens
             action = transition['action'][i]
             action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
-            fast_tokens = self.fast_tokenizer(action.cpu())
+            fast_tokens = self.fast_tokenizer(action.cpu())[0]
             vlm_action = map_fast_token_to_vlm_action(fast_tokens)
             
             task = transition['complementary_data']['task'][i]
@@ -372,18 +372,7 @@ def train(config: TrainingConfig):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 
-                model_inputs = {
-                    'input_ids': batch['input_ids'],
-                    'attention_mask': batch['attention_mask'],
-                    'labels': batch['labels']
-                }
-                
-                if 'pixel_values' in batch:
-                    model_inputs['pixel_values'] = batch['pixel_values']
-                if 'pixel_attention_mask' in batch:
-                    model_inputs['pixel_attention_mask'] = batch['pixel_attention_mask']
-                
-                outputs = model(**model_inputs)
+                outputs = model(**batch)
                 loss = outputs.loss
 
                 accelerator.backward(loss)
