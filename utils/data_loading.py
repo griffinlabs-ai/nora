@@ -10,7 +10,7 @@ import numpy as np
 from lerobot.configs.types import NormalizationMode
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import lerobot.processor
-import lerobot.datasets.utils
+import lerobot.datasets.io_utils
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
 
@@ -182,8 +182,8 @@ def load_dataset(
     ])
     
     # Load and prepare normalization stats
-    raw_norm_stats = lerobot.datasets.utils.cast_stats_to_numpy(
-        lerobot.datasets.utils.load_json(root / 'delta_norm_stats.json')
+    raw_norm_stats = lerobot.datasets.io_utils.cast_stats_to_numpy(
+        lerobot.datasets.io_utils.load_json(root / 'delta_norm_stats.json')
     )['norm_stats']
     
     # gripper min and max are currently hardcoded to 0 and 1.

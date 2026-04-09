@@ -93,7 +93,6 @@ cd lerobot_training
 conda create -n nora_lerobot python=3.10 -y
 conda activate nora_lerobot
 pip install -r lerobot_requirements.txt
-pip install flash_attn --no-build-isolation
 ```
 Model hyperparameters/settings are stored in the TrainingConfig in lerobot_training.py. You can specify the path to the corresponding Lerobot dataset you wish to finetune Nora on. Do note that Nora is pretrained on 7 DoF action space (6+1 grippler action), finetuning on other action space may not work well.
 

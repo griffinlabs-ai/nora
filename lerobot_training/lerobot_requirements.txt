@@ -1,4 +1,4 @@
-transformers
+transformers>=5.5
 qwen_vl_utils
 torchvision
 accelerate
@@ -8,4 +8,4 @@ scipy
 pillow
 safetensors
 tqdm
-lerobot==0.4.3
+lerobot==0.5.1

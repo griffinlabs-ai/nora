@@ -1,7 +1,5 @@
-from functools import lru_cache
 import sys
 import pathlib
-import traceback
 
 from torch.utils.data.dataset import ConcatDataset
 
@@ -28,12 +26,10 @@ from transformers import AutoModelForImageTextToText as AutoModelClass
 
 import lerobot.processor
 from lerobot.configs.types import PipelineFeatureType
-import numpy as np
 from tqdm import tqdm
 
 import load_datasets
-from utils.data_loading import collate_with_observation_image_lists, load_dataset
-import lerobot.processor.converters
+from utils.data_loading import collate_with_observation_image_lists
 
 logger = get_logger(__name__)
 
@@ -111,7 +107,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
     def __post_init__(self):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
+            "lerobot/fast-action-tokenizer", trust_remote_code=True,
         )
         
         # Dynamically calculate Action Token range
