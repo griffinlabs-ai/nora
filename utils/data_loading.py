@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, default_collate
 from typing import Any
 import pathlib
 import numpy as np
-from lerobot.configs.types import NormalizationMode
+from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import lerobot.processor
 import lerobot.datasets.io_utils
@@ -37,20 +37,25 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
 
     target_chunk_size: int
 
-    state_key: str = 'observation.state'
+    state_key: str | None = None
     """
     Key for the state tensor that corresponds to the action tensor.
+    If None, the initial state is assumed to be zero.
+    Leave as None if the action tensor is in delta space.
     """
 
     def __call__(self, transition):
         action = transition['action']
-        initial_state = transition['observation'][self.state_key]
+        if self.state_key is not None:
+            initial_state = transition['observation'][self.state_key]
+        else:
+            initial_state = torch.zeros(action.shape[-1])
         orig_chunk_size = action.shape[0]
 
         if orig_chunk_size == self.target_chunk_size:
             return transition
 
-        new_transition = transition.copy()        
+        new_transition = transition.copy()
 
         if orig_chunk_size % self.target_chunk_size == 0:
             # If the original chunk size is a multiple of the target chunk size, we can simply take every n-th action.
@@ -75,6 +80,11 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
         )
 
     def transform_features(self, features):
+        original_shape = features['action']['action'].shape
+        features['action']['action'] = PolicyFeature(
+            FeatureType.ACTION,
+            (self.target_chunk_size, original_shape[-1]),
+        )
         return features
 
 @dataclass
