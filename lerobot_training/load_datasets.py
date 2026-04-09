@@ -156,10 +156,17 @@ def galaxea_to_nora_instance(batch: dict[str, Any]):
     batch['observation.images.head'] = batch['observation.images.head_rgb']
     batch['observation.images.hand_left'] = batch['observation.images.left_wrist_rgb']
     batch['observation.images.hand_right'] = batch['observation.images.right_wrist_rgb']
+    batch['observation.images.head_is_pad'] = batch['observation.images.head_rgb_is_pad']
+    batch['observation.images.hand_left_is_pad'] = batch['observation.images.left_wrist_rgb_is_pad']
+    batch['observation.images.hand_right_is_pad'] = batch['observation.images.right_wrist_rgb_is_pad']
     del batch['observation.images.head_rgb']
     del batch['observation.images.head_right_rgb']
     del batch['observation.images.left_wrist_rgb']
     del batch['observation.images.right_wrist_rgb']
+    del batch['observation.images.head_rgb_is_pad']
+    del batch['observation.images.head_right_rgb_is_pad']
+    del batch['observation.images.left_wrist_rgb_is_pad']
+    del batch['observation.images.right_wrist_rgb_is_pad']
     return batch
 
 def interndata_a1_to_nora_instance(
@@ -213,7 +220,10 @@ def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
     )
     batch['observation.images.hand_left'] = batch['observation.images.hand']
     batch['observation.images.hand_right'] = None
+    batch['observation.images.hand_left_is_pad'] = batch['observation.images.hand_is_pad']
+    batch['observation.images.hand_right_is_pad'] = None
     del batch['observation.images.hand']
+    del batch['observation.images.hand_is_pad']
     return batch
 
 def load_agibot_world_dataset(
