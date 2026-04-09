@@ -264,20 +264,23 @@ def load_interndata_a1_dataset(
 ):
     root = pathlib.Path(root)
 
-    franka_dataset = load_dataset(
-        root / 'franka',
-        ("actions.joint.position", "actions.gripper.position"),
-        canonical_action_chunk_size,
-        canonical_action_chunk_size,
-        raw_fps = 30,
-        instance_transform = interndata_a1_franka_to_nora_instance,
-        norm_stats_transform = functools.partial(
-            merge_norm_stats,
-            merge_prefix = 'actions',
-            merge_spec = MERGE_SPECS['interndata_a1_franka'],
-        ),
-        num_frames = num_frames
-    )
+    franka_datasets = [
+        load_dataset(
+            root / f'franka-{i}',
+            ("actions.joint.position", "actions.gripper.position"),
+            canonical_action_chunk_size,
+            canonical_action_chunk_size,
+            raw_fps = 30,
+            instance_transform = interndata_a1_franka_to_nora_instance,
+            norm_stats_transform = functools.partial(
+                merge_norm_stats,
+                merge_prefix = 'actions',
+                merge_spec = MERGE_SPECS['interndata_a1_franka'],
+            ),
+            num_frames = num_frames
+        )
+        for i in ('1', '2')
+    ]
     dual_arm_action_keys = (
         "actions.left_joint.position",
         "actions.left_gripper.position",
@@ -323,4 +326,4 @@ def load_interndata_a1_dataset(
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
         num_frames = num_frames
     )
-    return ConcatDataset([franka_dataset, genie1_dataset, lift2_dataset, split_aloha_dataset])
+    return ConcatDataset([*franka_datasets, genie1_dataset, lift2_dataset, split_aloha_dataset])

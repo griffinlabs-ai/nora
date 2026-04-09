@@ -25,7 +25,8 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/interndata-a1 \
     yixuan-tan/InternData-A1-LeRobot-v3.0-by-embodiment \
-    franka/articulation_tasks/close_the_electriccooker/ \
+    franka-1/articulation_tasks/close_the_electriccooker/ \
+    franka-2/basic_tasks/pick_the_object_into_trashcan/ \
     genie1/basic_tasks/take_shelf_items_to_cart_left_arm_part1/ \
     lift2/long_horizon_tasks/clean_the_dirt_with_brown_cloth_left_arm/ \
     split_aloha/pick_and_place_tasks/parallel_pick_and_place/basket_top/ \
