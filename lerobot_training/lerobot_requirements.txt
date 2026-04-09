@@ -1,5 +1,4 @@
 transformers>=5.5
-qwen_vl_utils
 torchvision
 accelerate
 wandb
