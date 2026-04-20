@@ -13,8 +13,12 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/galaxea-open-world-dataset \
     griffinlabs/Galaxea-Open-World-Dataset-LeRobot-v3.0 \
+<<<<<<< HEAD
     --include \
         $(sed 's/$/\//' < arm-and-gripper-only-subsets.txt)
+=======
+    $(sed 's/$/\//' < arm-and-gripper-only-subsets.txt)
+>>>>>>> origin/main
 
 # move delta norm stats to correct location
 mv \

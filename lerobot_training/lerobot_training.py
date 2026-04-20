@@ -1,7 +1,6 @@
 from functools import lru_cache
 import sys
 import pathlib
-import traceback
 
 from torch.utils.data.dataset import ConcatDataset
 
@@ -61,9 +60,9 @@ class TrainingConfig:
     # Updated to use Gemma-4 E4B
     model_id: str = "google/gemma-4-E4B-it" 
     action_vocab_size: int = 2048
-    
-    # Standard vision target size
-    image_target_size: Tuple[int, int] = (224, 224) 
+
+    # Gemma 4 image token budget
+    max_tokens_per_image: int = 70
     
     # Number of frames to input (5 past + 1 current = 6)
     num_frames: int = 6
@@ -77,20 +76,35 @@ def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
 
-@dataclass
 class NoraImageTransform:
-    target_size: Tuple[int, int]
+    """
+    Image augmentation transforms for Nora policy training.
+    Applies relative-size random crop and color jitter.
+    """
 
-    def __post_init__(self):
-        self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-        self.crop_transform = T_v2.RandomResizedCrop(
-            size=self.target_size,
-            scale=(0.9, 1.0),
-            ratio=(0.9, 1.1),
+    BRIGHTNESS_FACTOR = 0.2
+    CONTRAST_FACTOR = 0.2
+    SATURATION_FACTOR = 0.2
+    HUE_FACTOR = 0.05
+    CROP_SCALE = 0.9
+
+    def __init__(self):
+        self.color_jitter = T_v2.ColorJitter(
+            brightness=self.BRIGHTNESS_FACTOR,
+            contrast=self.CONTRAST_FACTOR,
+            saturation=self.SATURATION_FACTOR,
+            hue=self.HUE_FACTOR,
         )
 
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def get_random_crop_transform(source_size: Tuple[int, int], scale: float) -> T_v2.RandomCrop:
+        linear_scale = scale ** 0.5
+        target_size = round(source_size[0] * linear_scale), round(source_size[1] * linear_scale)
+        return T_v2.RandomCrop(target_size)
+
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        image = self.crop_transform(image)
+        image = self.get_random_crop_transform(image.shape[-2:], self.CROP_SCALE)(image)
         image = self.color_jitter(image)
         return image
 
@@ -111,7 +125,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
     def __post_init__(self):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
+            "lerobot/fast-action-tokenizer", trust_remote_code=True,
         )
         
         # Dynamically calculate Action Token range
@@ -125,9 +139,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         else:
             raise ValueError("Action Tokens not found in the Gemma vocabulary!")
 
-        self.nora_image_transform = NoraImageTransform(
-            target_size = self.config.image_target_size
-        )
+        self.nora_image_transform = NoraImageTransform()
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
         batch_size = transition['action'].shape[0]
@@ -147,9 +159,9 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             for t in range(T):
                 for k in self.IMAGE_KEYS:
                     img_tensor = obs_dict[k][i]
-                    frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
-                    transformed_frame = self.nora_image_transform(frame) if frame is not None else None
-                    if transformed_frame is not None:
+                    if img_tensor is not None:
+                        frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
+                        transformed_frame = self.nora_image_transform(frame)
                         imgs_for_this_sample.append(transformed_frame)
             
             batch_images.append(imgs_for_this_sample)
@@ -157,7 +169,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             # 2. Extract Action Tokens
             action = transition['action'][i]
             action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
-            fast_tokens = self.fast_tokenizer(action.cpu())
+            fast_tokens = self.fast_tokenizer(action.cpu())[0]
             vlm_action = map_fast_token_to_vlm_action(fast_tokens)
             
             task = transition['complementary_data']['task'][i]
@@ -226,7 +238,12 @@ def make_policy_processor(config: TrainingConfig, transformer_processor: Any) ->
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     """Loads Gemma-4, its processor, injects action tokens, and applies embedding hotfix."""
-    transformer_processor = AutoProcessor.from_pretrained(config.model_id, trust_remote_code=True)
+    transformer_processor = AutoProcessor.from_pretrained(
+        config.model_id,
+        trust_remote_code=True,
+        max_soft_tokens=config.max_tokens_per_image,
+        image_seq_length=config.max_tokens_per_image,
+    )
     
     # Ensure pad token exists
     if transformer_processor.tokenizer.pad_token is None:
@@ -372,18 +389,7 @@ def train(config: TrainingConfig):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 
-                model_inputs = {
-                    'input_ids': batch['input_ids'],
-                    'attention_mask': batch['attention_mask'],
-                    'labels': batch['labels']
-                }
-                
-                if 'pixel_values' in batch:
-                    model_inputs['pixel_values'] = batch['pixel_values']
-                if 'pixel_attention_mask' in batch:
-                    model_inputs['pixel_attention_mask'] = batch['pixel_attention_mask']
-                
-                outputs = model(**model_inputs)
+                outputs = model(**batch)
                 loss = outputs.loss
 
                 accelerator.backward(loss)

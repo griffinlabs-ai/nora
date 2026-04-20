@@ -20,6 +20,42 @@ ACTION_DIM_IS_PAD = {
 
 MergeSpec = Iterable[tuple[str, slice] | tuple[float, int]]
 
+MERGE_SPECS = {
+    'agibot_world': (
+        ('joint.position', slice(0, 7)),
+        ('effector.position', slice(0, 1)),
+        ('joint.position', slice(7, 14)),
+        ('effector.position', slice(1, 2)),
+    ),
+    'galaxea': (
+        ('left_arm', slice(None)),
+        (0.0, 1),
+        ('left_gripper', slice(None)),
+        ('right_arm', slice(None)),
+        (0.0, 1),
+        ('right_gripper', slice(None)),
+    ),
+    'interndata_a1_franka': (
+        ('joint.position', slice(None)),
+        ('gripper.position', slice(None)),
+        (0.0, 8),
+    ),
+    'interndata_a1_genie1': (
+        ('left_joint.position', slice(None)),
+        ('left_gripper.position', slice(None)),
+        ('right_joint.position', slice(None)),
+        ('right_gripper.position', slice(None)),
+    ),
+    'interndata_a1_dual_arm_6dof': (
+        ('left_joint.position', slice(None)),
+        (0.0, 1),
+        ('left_gripper.position', slice(None)),
+        ('right_joint.position', slice(None)),
+        (0.0, 1),
+        ('right_gripper.position', slice(None)),
+    ),
+}
+
 def merge_features(
     inst: dict[str, Any],
     merge_prefix: str,
@@ -50,6 +86,25 @@ def merge_features(
     new_inst[merged_feature_key or merge_prefix] = torch.cat(to_cat, dim = -1)
     return new_inst
 
+def merge_norm_stats(
+    norm_stats: dict[str, dict[str, np.ndarray]],
+    merge_prefix: str,
+    merge_spec: MergeSpec,
+) -> dict[str, dict[str, np.ndarray]]:
+    norm_stats = {
+        'q01': {feat: torch.from_numpy(norm_stats[feat]['q01']).view(-1) for feat in norm_stats},
+        'q99': {feat: torch.from_numpy(norm_stats[feat]['q99']).view(-1) for feat in norm_stats},
+    }
+    merged = {
+        'q01': merge_features(norm_stats['q01'], merge_prefix, merge_spec, 'action'),
+        'q99': merge_features(norm_stats['q99'], merge_prefix, merge_spec, 'action'),
+    }
+    merged = {
+        feat: {'q01': merged['q01'][feat].numpy(), 'q99': merged['q99'][feat].numpy()}
+        for feat in merged['q01']
+    }
+    return merged
+
 def generic_to_nora_instance(
     batch: dict[str, Any],
     merge_spec: MergeSpec,
@@ -74,12 +129,7 @@ def agibot_world_to_nora_instance(batch: dict[str, Any]):
     batch['actions.effector.position'] = 1 - batch['actions.effector.position']
     return generic_to_nora_instance(
         batch,
-        merge_spec = [
-            ('joint.position', slice(0, 7)),
-            ('effector.position', slice(0, 1)),
-            ('joint.position', slice(7, 14)),
-            ('effector.position', slice(1, 2)),
-        ],
+        merge_spec = MERGE_SPECS['agibot_world'],
         action_prefix = 'actions',
         state_prefix = 'observation.states',
         action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_7dof'],
@@ -98,14 +148,7 @@ def galaxea_to_nora_instance(batch: dict[str, Any]):
     batch['action.right_gripper'] = batch['action.right_gripper'].view(-1, 1)
     batch = generic_to_nora_instance(
         batch,
-        merge_spec = [
-            ('left_arm', slice(None)),
-            (0.0, 1),
-            ('left_gripper', slice(None)),
-            ('right_arm', slice(None)),
-            (0.0, 1),
-            ('right_gripper', slice(None)),
-        ],
+        merge_spec = MERGE_SPECS['galaxea'],
         action_prefix = 'action',
         state_prefix = 'observation.state',
         action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
@@ -115,10 +158,17 @@ def galaxea_to_nora_instance(batch: dict[str, Any]):
     batch['observation.images.head'] = batch['observation.images.head_rgb']
     batch['observation.images.hand_left'] = batch['observation.images.left_wrist_rgb']
     batch['observation.images.hand_right'] = batch['observation.images.right_wrist_rgb']
+    batch['observation.images.head_is_pad'] = batch['observation.images.head_rgb_is_pad']
+    batch['observation.images.hand_left_is_pad'] = batch['observation.images.left_wrist_rgb_is_pad']
+    batch['observation.images.hand_right_is_pad'] = batch['observation.images.right_wrist_rgb_is_pad']
     del batch['observation.images.head_rgb']
     del batch['observation.images.head_right_rgb']
     del batch['observation.images.left_wrist_rgb']
     del batch['observation.images.right_wrist_rgb']
+    del batch['observation.images.head_rgb_is_pad']
+    del batch['observation.images.head_right_rgb_is_pad']
+    del batch['observation.images.left_wrist_rgb_is_pad']
+    del batch['observation.images.right_wrist_rgb_is_pad']
     return batch
 
 def interndata_a1_to_nora_instance(
@@ -146,38 +196,19 @@ def interndata_a1_to_nora_instance(
 
 interndata_a1_genie1_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = [
-        ('left_joint.position', slice(None)),
-        ('left_gripper.position', slice(None)),
-        ('right_joint.position', slice(None)),
-        ('right_gripper.position', slice(None)),
-    ],
+    merge_spec = MERGE_SPECS['interndata_a1_genie1'],
     action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_7dof'],
     embodiment_prompt = "InternData-A1 simulated Genie1 with 2 grippers",
 )
 interndata_a1_lift2_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = [
-        ('left_joint.position', slice(None)),
-        (0.0, 1),
-        ('left_gripper.position', slice(None)),
-        ('right_joint.position', slice(None)),
-        (0.0, 1),
-        ('right_gripper.position', slice(None)),
-    ],
+    merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
     action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Lift-2 with R5a arms",
 )
 interndata_a1_split_aloha_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = [
-        ('left_joint.position', slice(None)),
-        (0.0, 1),
-        ('left_gripper.position', slice(None)),
-        ('right_joint.position', slice(None)),
-        (0.0, 1),
-        ('right_gripper.position', slice(None)),
-    ],
+    merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
     action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Split Aloha with 2 Piper-100 arms",
 )
@@ -185,17 +216,16 @@ interndata_a1_split_aloha_to_nora_instance = functools.partial(
 def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
     batch = interndata_a1_to_nora_instance(
         batch,
-        merge_spec = [
-            ('joint.position', slice(None)),
-            ('gripper.position', slice(None)),
-            (0.0, 8),
-        ],
+        merge_spec = MERGE_SPECS['interndata_a1_franka'],
         action_dim_is_pad = ACTION_DIM_IS_PAD['single_arm_7dof'],
         embodiment_prompt = "InternData-A1 simulated Franka Emika Panda",
     )
     batch['observation.images.hand_left'] = batch['observation.images.hand']
     batch['observation.images.hand_right'] = None
+    batch['observation.images.hand_left_is_pad'] = batch['observation.images.hand_is_pad']
+    batch['observation.images.hand_right_is_pad'] = None
     del batch['observation.images.hand']
+    del batch['observation.images.hand_is_pad']
     return batch
 
 def load_agibot_world_dataset(
@@ -210,12 +240,11 @@ def load_agibot_world_dataset(
         canonical_action_chunk_size,
         raw_fps = 30,
         instance_transform = agibot_world_to_nora_instance,
-        norm_stats_transform = lambda norm_stats: {
-            "action": {
-                "q01": np.append(np.insert(norm_stats['actions.joint.position']['q01'], 7, 0), 0),
-                "q99": np.append(np.insert(norm_stats['actions.joint.position']['q99'], 7, 1), 1),
-            }
-        },
+        norm_stats_transform = functools.partial(
+            merge_norm_stats,
+            merge_prefix = 'actions',
+            merge_spec = MERGE_SPECS['agibot_world'],
+        ),
         num_frames = num_frames
     )
 
@@ -232,23 +261,11 @@ def load_galaxea_dataset(
         canonical_action_chunk_size,
         raw_fps = 15,
         instance_transform = galaxea_to_nora_instance,
-        norm_stats_transform = lambda norm_stats:
-            {
-                "action": {
-                    "q01": np.concatenate([
-                        norm_stats['action.left_arm']['q01'],
-                        np.array([0.0, 0.0]),
-                        norm_stats['action.right_arm']['q01'],
-                        np.array([0.0, 0.0]),
-                    ]),
-                    "q99": np.concatenate([
-                        norm_stats['action.left_arm']['q99'],
-                        np.array([0.0, 1.0]),
-                        norm_stats['action.right_arm']['q99'],
-                        np.array([0.0, 1.0]),
-                    ]),
-                }
-            },
+        norm_stats_transform = functools.partial(
+            merge_norm_stats,
+            merge_prefix = 'action',
+            merge_spec = MERGE_SPECS['galaxea'],
+        ),
         num_frames = num_frames
     )
 
@@ -259,27 +276,23 @@ def load_interndata_a1_dataset(
 ):
     root = pathlib.Path(root)
 
-    franka_dataset = load_dataset(
-        root / 'franka',
-        ("actions.joint.position", "actions.gripper.position"),
-        canonical_action_chunk_size,
-        canonical_action_chunk_size,
-        raw_fps = 30,
-        instance_transform = interndata_a1_franka_to_nora_instance,
-        norm_stats_transform = lambda norm_stats: {
-            "action": {
-                "q01": np.concatenate([
-                    norm_stats['actions.joint.position']['q01'],
-                    np.array([0.0] * 9),
-                ]),
-                "q99": np.concatenate([
-                    norm_stats['actions.joint.position']['q99'],
-                    np.array([1.0] * 9),
-                ]),
-            }
-        },
-        num_frames = num_frames
-    )
+    franka_datasets = [
+        load_dataset(
+            root / f'franka-{i}',
+            ("actions.joint.position", "actions.gripper.position"),
+            canonical_action_chunk_size,
+            canonical_action_chunk_size,
+            raw_fps = 30,
+            instance_transform = interndata_a1_franka_to_nora_instance,
+            norm_stats_transform = functools.partial(
+                merge_norm_stats,
+                merge_prefix = 'actions',
+                merge_spec = MERGE_SPECS['interndata_a1_franka'],
+            ),
+            num_frames = num_frames
+        )
+        for i in ('1', '2')
+    ]
     dual_arm_action_keys = (
         "actions.left_joint.position",
         "actions.left_gripper.position",
@@ -293,40 +306,18 @@ def load_interndata_a1_dataset(
         canonical_action_chunk_size,
         raw_fps = 30,
         instance_transform = interndata_a1_genie1_to_nora_instance,
-        norm_stats_transform = lambda norm_stats: {
-            "action": {
-                "q01": np.concatenate([
-                    norm_stats['actions.left_joint.position']['q01'],
-                    np.array([0.0]),
-                    norm_stats['actions.right_joint.position']['q01'],
-                    np.array([0.0]),
-                ]),
-                "q99": np.concatenate([
-                    norm_stats['actions.left_joint.position']['q99'],
-                    np.array([1.0]),
-                    norm_stats['actions.right_joint.position']['q99'],
-                    np.array([1.0]),
-                ]),
-            }
-        },
+        norm_stats_transform = functools.partial(
+            merge_norm_stats,
+            merge_prefix = 'actions',
+            merge_spec = MERGE_SPECS['interndata_a1_genie1'],
+        ),
         num_frames = num_frames
     )
-    dual_arm_6dof_norm_stats_transform = lambda norm_stats: {
-        "action": {
-            "q01": np.concatenate([
-                norm_stats['actions.left_joint.position']['q01'],
-                np.array([0.0, 0.0]),
-                norm_stats['actions.right_joint.position']['q01'],
-                np.array([0.0, 0.0]),
-            ]),
-            "q99": np.concatenate([
-                norm_stats['actions.left_joint.position']['q99'],
-                np.array([0.0, 1.0]),
-                norm_stats['actions.right_joint.position']['q99'],
-                np.array([0.0, 1.0]),
-            ]),
-        }
-    }
+    dual_arm_6dof_norm_stats_transform = functools.partial(
+        merge_norm_stats,
+        merge_prefix = 'actions',
+        merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
+    )
     lift2_dataset = load_dataset(
         root / 'lift2',
         dual_arm_action_keys,
@@ -347,7 +338,6 @@ def load_interndata_a1_dataset(
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
         num_frames = num_frames
     )
-    return ConcatDataset([franka_dataset, genie1_dataset, lift2_dataset, split_aloha_dataset])
 
 def load_math_reasoning_datasets(samples_per_dataset: int = 50):
     """
