@@ -13,6 +13,9 @@ import lerobot.processor
 import lerobot.datasets.utils
 from torch.utils.data import ConcatDataset
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler, default_collate
+from typing import Any, Mapping
+import torch
 
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
 
@@ -246,3 +249,122 @@ def collate_with_observation_image_lists(
         **default_collate(no_images)
     }
     return collated
+
+
+class UnifiedVLAWrapper(Dataset):
+    """
+    A wrapper to unify the output of Robotics Datasets and VL Math Datasets.
+    Ensures that both return identical dictionary keys (input_ids, labels, pixel_values, etc.)
+    ready for the VLA model's forward pass.
+    """
+    def __init__(self, dataset, task_type: str, policy_processor=None, text_tokenizer=None):
+        self.dataset = dataset
+        self.task_type = task_type
+        self.policy_processor = policy_processor
+        self.text_tokenizer = text_tokenizer
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+
+        if self.task_type == "robot":
+            # 1. Process robotics trajectory through your existing pipeline
+            transition = self.policy_processor(item)
+            return transition # This should return the dictionary with input_ids, labels, etc.
+            
+        elif self.task_type == "vl_math":
+            # 2. Process VL Math data
+            image = item["image"]
+            instruction = item["instruction"]
+            text_answer = item["text_answer"]
+
+            # Construct conversational prompt
+            messages = [
+                {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": instruction}]},
+                {"role": "assistant", "content": [{"type": "text", "text": text_answer}]}
+            ]
+            
+            # Use the text_tokenizer/processor to format the strings and mask the loss
+            prompt_text = self.text_tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False
+            )
+            
+            inputs = self.text_tokenizer(
+                text=prompt_text, 
+                images=[image], 
+                return_tensors="pt", 
+                padding="max_length", 
+                max_length=512,
+                truncation=True
+            )
+            
+            # Squeeze batch dimension added by the tokenizer
+            inputs = {k: v.squeeze(0) for k, v in inputs.items()}
+            
+            # Standard Next-Token Prediction Masking: Mask prompt, calculate loss on answer
+            labels = inputs["input_ids"].clone()
+            
+            # Simple heuristic: find the assistant token and mask everything before it with -100
+            assistant_token_id = self.text_tokenizer.tokenizer.convert_tokens_to_ids("<|im_start|>assistant")
+            if assistant_token_id is not None:
+                assistant_idx = (labels == assistant_token_id).nonzero(as_tuple=True)[0]
+                if len(assistant_idx) > 0:
+                    labels[:assistant_idx[0] + 1] = -100
+                    
+            labels[labels == self.text_tokenizer.tokenizer.pad_token_id] = -100
+            inputs["labels"] = labels
+            
+            return inputs
+
+
+def build_co_training_dataloader(
+    robot_dataset: Dataset, 
+    math_hf_dataset, 
+    batch_size: int, 
+    robot_ratio: float = 0.8,
+    policy_processor = None,
+    text_tokenizer = None,
+    num_workers: int = 4
+):
+    """
+    Creates a DataLoader that mixes robotics data and math reasoning data
+    at a specific ratio (e.g., 80% Robot, 20% Math) to prevent catastrophic forgetting.
+    """
+    # 1. Wrap datasets
+    wrapped_robot = UnifiedVLAWrapper(robot_dataset, task_type="robot", policy_processor=policy_processor)
+    wrapped_math = UnifiedVLAWrapper(math_hf_dataset, task_type="vl_math", text_tokenizer=text_tokenizer)
+    
+    # 2. Concatenate
+    combined_dataset = ConcatDataset([wrapped_robot, wrapped_math])
+    
+    # 3. Calculate weights for WeightedRandomSampler
+    total_robot_len = len(wrapped_robot)
+    total_math_len = len(wrapped_math)
+    
+    weight_robot = robot_ratio / total_robot_len
+    weight_math = (1.0 - robot_ratio) / total_math_len
+    
+    sample_weights = (
+        [weight_robot] * total_robot_len + 
+        [weight_math] * total_math_len
+    )
+    
+    # 4. Build Sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, 
+        num_samples=len(combined_dataset), 
+        replacement=True 
+    )
+    
+    # 5. Build Dataloader
+    dataloader = DataLoader(
+        combined_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    
+    return dataloader
