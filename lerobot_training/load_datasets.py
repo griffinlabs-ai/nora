@@ -4,6 +4,7 @@ from typing import Any, Iterable
 import torch
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
+from datasets import load_dataset as hf_load_dataset, concatenate_datasets, Image as HFImage
 
 import numpy as np
 
@@ -337,3 +338,101 @@ def load_interndata_a1_dataset(
         num_frames = num_frames
     )
     return ConcatDataset([*franka_datasets, genie1_dataset, lift2_dataset, split_aloha_dataset])
+
+def load_math_reasoning_datasets(samples_per_dataset: int = 50):
+    """
+    Loads and standardizes mathematical reasoning datasets from Hugging Face.
+    Converts various dataset formats into a unified schema:
+    {'image': PIL.Image, 'instruction': str, 'text_answer': str, 'task_type': 'vl_math'}
+    """
+    standardized_datasets = []
+
+    def standardize_format(example, img_col, inst_col, ans_col):
+        img_data = example.get(img_col)
+        image = None
+        
+        try:
+            if img_data is not None:
+                if isinstance(img_data, list):
+                    img_data = img_data[0] if len(img_data) > 0 else None
+                
+                if hasattr(img_data, "convert"):
+                    image = img_data.convert('RGB')
+        except Exception:
+            image = None
+
+        return {
+            "image": image,
+            "instruction": str(example.get(inst_col, "")),
+            "text_answer": str(example.get(ans_col, "")),
+            "task_type": "vl_math"
+        }
+
+    # Helper function to cast the image column explicitly
+    def cast_image_feature(dataset):
+        if len(dataset) > 0:
+            return dataset.cast_column("image", HFImage())
+        return dataset
+
+    # 1. MathVision
+    try:
+        mathvision = hf_load_dataset("MathLLMs/MathVision", split="test") 
+        mathvision = mathvision.map(
+            lambda x: standardize_format(x, "image", "question", "answer"),
+            remove_columns=mathvision.column_names
+        ).filter(lambda x: x["image"] is not None)
+        
+        mathvision = mathvision.select(range(min(samples_per_dataset, len(mathvision))))
+        mathvision = cast_image_feature(mathvision)
+        standardized_datasets.append(mathvision)
+    except Exception as e:
+        print(f"Skipping MathVision: {e}")
+
+    # 2. MathVista
+    try:
+        mathvista = hf_load_dataset("AI4Math/MathVista", split="testmini")
+        mathvista = mathvista.map(
+            lambda x: standardize_format(x, "decoded_image", "query", "answer"),
+            remove_columns=mathvista.column_names
+        ).filter(lambda x: x["image"] is not None)
+        
+        mathvista = mathvista.select(range(min(samples_per_dataset, len(mathvista))))
+        mathvista = cast_image_feature(mathvista)
+        standardized_datasets.append(mathvista)
+    except Exception as e:
+        print(f"Skipping MathVista: {e}")
+
+    # 3. CLEVR-Math
+    try:
+        clevr = hf_load_dataset("WaltonFuture/clevr-math", split="train")
+        clevr = clevr.map(
+            lambda x: standardize_format(x, "images", "problem", "answer"),
+            remove_columns=clevr.column_names
+        ).filter(lambda x: x["image"] is not None)
+        
+        clevr = clevr.select(range(min(samples_per_dataset, len(clevr))))
+        clevr = cast_image_feature(clevr)
+        standardized_datasets.append(clevr)
+    except Exception as e:
+        print(f"Skipping CLEVR-Math: {e}")
+
+    # 4. GEOQA_8K_R1V
+    try:
+        geoqa = hf_load_dataset("leonardPKU/GEOQA_8K_R1V", split="train")
+        geoqa = geoqa.map(
+            lambda x: standardize_format(x, "images", "problem", "answer"),
+            remove_columns=geoqa.column_names
+        ).filter(lambda x: x["image"] is not None)
+        
+        geoqa = geoqa.select(range(min(samples_per_dataset, len(geoqa))))
+        geoqa = cast_image_feature(geoqa)
+        standardized_datasets.append(geoqa)
+    except Exception as e:
+        print(f"Skipping GEOQA: {e}")
+
+    if not standardized_datasets:
+        raise RuntimeError("Failed to load any math reasoning datasets.")
+        
+    mixed_math_dataset = concatenate_datasets(standardized_datasets)
+    mixed_math_dataset = mixed_math_dataset.shuffle(seed=42)
+    return mixed_math_dataset
