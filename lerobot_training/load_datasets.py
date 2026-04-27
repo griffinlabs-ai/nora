@@ -8,12 +8,19 @@ from utils.data_loading import load_dataset
 import numpy as np
 
 ACTION_DIM_IS_PAD = {
-    'dual_arm_7dof': torch.zeros(16, dtype=torch.bool),
-    'dual_arm_6dof': torch.tensor(
-        [False, False, False, False, False, False, True, False] * 2,
+    'dual_arm_7dof': torch.tensor(
+        [False, False, False, False, False, False, False, False, True, True, True, True, True, True] * 2,
         dtype=torch.bool
     ),
-    'single_arm_7dof': torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool),
+    'dual_arm_6dof': torch.tensor(
+        [False, False, False, False, False, False, True, False, True, True, True, True, True, True] * 2,
+        dtype=torch.bool
+    ),
+    'single_arm_7dof': torch.tensor([False] * 8 + [True] * 20, dtype=torch.bool),
+    "egodex": torch.tensor(
+        [False, False, False, False, False, False, True, False, False, False, False, False, False, False] * 2,
+        dtype=torch.bool
+    ),
 }
 
 MergeSpecItem = tuple[str, slice] | tuple[str, Literal['se3_matrix']] | tuple[float, int]
@@ -23,35 +30,51 @@ MERGE_SPECS = {
     'agibot_world': (
         ('joint.position', slice(0, 7)),
         ('effector.position', slice(0, 1)),
+        (0.0, 6),
         ('joint.position', slice(7, 14)),
         ('effector.position', slice(1, 2)),
+        (0.0, 6),
     ),
     'galaxea': (
         ('left_arm', slice(None)),
         (0.0, 1),
         ('left_gripper', slice(None)),
+        (0.0, 6),
         ('right_arm', slice(None)),
         (0.0, 1),
         ('right_gripper', slice(None)),
+        (0.0, 6),
     ),
     'interndata_a1_franka': (
         ('joint.position', slice(None)),
         ('gripper.position', slice(None)),
-        (0.0, 8),
+        (0.0, 20),
     ),
     'interndata_a1_genie1': (
         ('left_joint.position', slice(None)),
         ('left_gripper.position', slice(None)),
+        (0.0, 6),
         ('right_joint.position', slice(None)),
         ('right_gripper.position', slice(None)),
+        (0.0, 6),
     ),
     'interndata_a1_dual_arm_6dof': (
         ('left_joint.position', slice(None)),
         (0.0, 1),
         ('left_gripper.position', slice(None)),
+        (0.0, 6),
         ('right_joint.position', slice(None)),
         (0.0, 1),
         ('right_gripper.position', slice(None)),
+        (0.0, 6),
+    ),
+    'egodex': (
+        ('leftHand', 'se3_matrix'),
+        (0.0, 1),
+        ('leftFingers', slice(None)),
+        ('rightHand', 'se3_matrix'),
+        (0.0, 1),
+        ('rightFingers', slice(None)),
     ),
 }
 
@@ -249,6 +272,25 @@ def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
     del batch['observation.images.hand_is_pad']
     return batch
 
+def egodex_to_nora_instance(batch: dict[str, Any]):
+    batch = generic_to_nora_instance(
+        batch,
+        merge_spec = MERGE_SPECS['egodex'],
+        action_prefix = 'action',
+        state_prefix = 'observation.state',
+        action_dim_is_pad = ACTION_DIM_IS_PAD['egodex'],
+        embodiment_prompt = "simplified real human hands (from Apple Vision Pro tracking)",
+    )
+    batch['observation.images.head'] = batch['observation.images.camera']
+    batch['observation.images.hand_left'] = None
+    batch['observation.images.hand_right'] = None
+    batch['observation.images.head_is_pad'] = batch['observation.images.camera_is_pad']
+    batch['observation.images.hand_left_is_pad'] = None
+    batch['observation.images.hand_right_is_pad'] = None
+    del batch['observation.images.camera']
+    del batch['observation.images.camera_is_pad']
+    return batch
+
 def load_agibot_world_dataset(
     root: str,
     canonical_action_chunk_size: int,
@@ -360,3 +402,34 @@ def load_interndata_a1_dataset(
         num_frames = num_frames
     )
     return ConcatDataset([*franka_datasets, genie1_dataset, lift2_dataset, split_aloha_dataset])
+
+def load_egodex_dataset(
+    root: str | pathlib.Path,
+    canonical_action_chunk_size: int,
+    num_frames: int = 1,
+):
+    return load_dataset(
+        root,
+        ("action.leftHand", "action.rightHand", "action.leftFingers", "action.rightFingers"),
+        canonical_action_chunk_size,
+        canonical_action_chunk_size,
+        raw_fps = 30,
+        instance_transform = egodex_to_nora_instance,
+        norm_stats_transform = functools.partial(
+            merge_norm_stats,
+            merge_prefix = 'action',
+            merge_spec = MERGE_SPECS['egodex'],
+        ),
+        se3_segment_start_idxs = frozenset((0, 24)),
+        delta_transform_mask = torch.cat(
+            [
+                torch.ones(16), # left wrist SE(3)
+                torch.zeros(1), # left wrist padding
+                torch.zeros(7), # left fingers
+                torch.ones(16), # right wrist SE(3)
+                torch.zeros(1), # right wrist padding
+                torch.zeros(7), # right fingers
+            ],
+        ).bool(),
+        num_frames = num_frames
+    )

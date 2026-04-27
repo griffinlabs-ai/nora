@@ -242,6 +242,14 @@ def load_lerobot_dataset_skip_dirty_episodes(
             episodes = [i for i in range(total_episodes) if i not in removed_episodes]
     return LeRobotDataset(repo_id, root, episodes, *args, **kwargs)
 
+DEFAULT_DELTA_TRANSFORM_MASK = torch.tensor(
+    [
+        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+    ],
+    dtype=torch.bool,
+)
+
 def load_dataset(
     root: str | pathlib.Path,
     action_keys: Iterable[str],
@@ -251,6 +259,7 @@ def load_dataset(
     instance_transform: Callable[[dict[str, Any]], dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
     se3_segment_start_idxs: Set[int] | None = None,
+    delta_transform_mask: torch.Tensor | None = None,
     num_frames: int = 1, 
 ) -> PreprocessedDataset:
     """
@@ -319,17 +328,11 @@ def load_dataset(
     resample_step_if_necessary = [ResampleActionProcessorStep(
         target_chunk_size = canonical_action_chunk_size,
     )] if load_action_chunk_size != canonical_action_chunk_size else []
-    
+
     preprocessor = PolicyProcessorPipeline(
         steps = [
             Abs2DeltaActionProcessorStep(
-                mask = torch.tensor(
-                    [
-                        True, True, True, True, True, True, True, False,
-                        True, True, True, True, True, True, True, False,
-                    ],
-                    dtype=torch.bool,
-                ),
+                mask = delta_transform_mask if delta_transform_mask is not None else DEFAULT_DELTA_TRANSFORM_MASK,
                 se3_segment_start_idxs = se3_segment_start_idxs,
             ),
             *convert_se3_if_necessary,
