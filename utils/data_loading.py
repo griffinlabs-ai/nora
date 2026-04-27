@@ -34,6 +34,11 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
     """
     target_chunk_size: int
     state_key: str | None = None
+    """
+    Key for the state tensor that corresponds to the action tensor.
+    If None, the initial state is assumed to be zero.
+    Leave as None if the action tensor is in delta space.
+    """
 
     def __call__(self, transition):
         action = transition['action']
@@ -49,6 +54,7 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
         new_transition = transition.copy()
 
         if orig_chunk_size % self.target_chunk_size == 0:
+            # If the original chunk size is a multiple of the target chunk size, we can simply take every n-th action.
             step_size = orig_chunk_size // self.target_chunk_size
             new_transition['action'] = action[step_size-1::step_size]
             return new_transition
@@ -82,9 +88,18 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
 class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
     """
     Convert action tensor from absolute space to delta space.
+    Expects an action shape of [..., chunk_size, degrees_of_freedom].
+    Expects transition to have a state tensor in the same vector space as the action tensor.
     """
     mask: torch.Tensor
+    """
+    Mask of which action tensor dimensions to convert to delta space.
+    `True` dimensions output delta space, `False` dimensions keep absolute space.
+    """
     state_key: str = 'observation.state'
+    """
+    Key for the state tensor that corresponds to the action tensor.
+    """
 
     def __call__(self, transition):
         new_transition = transition.copy()
@@ -106,6 +121,13 @@ def load_lerobot_dataset_skip_dirty_episodes(
     *args,
     **kwargs,
 ) -> PreprocessedDataset:
+    """
+    Loads preprocessed dataset. The following preprocessing steps are applied:
+    - Transform the instance from the raw dataset to the desired format (by the `instance_transform` param).
+    - Convert action tensor from absolute space to delta space.
+    - Resample the action tensor from one chunk size to another if necessary.
+    - Normalize the action tensor.
+    """
     if episodes is None and root is not None:
         removed_episodes_path = pathlib.Path(root) / 'meta/removed_episodes.json'
         if removed_episodes_path.exists():
