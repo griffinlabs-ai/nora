@@ -1,6 +1,6 @@
 import functools
 import pathlib
-from typing import Any, Iterable
+from typing import Any, Literal, Sequence
 import torch
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
@@ -16,7 +16,8 @@ ACTION_DIM_IS_PAD = {
     'single_arm_7dof': torch.tensor([False] * 8 + [True] * 8, dtype=torch.bool),
 }
 
-MergeSpec = Iterable[tuple[str, slice] | tuple[float, int]]
+MergeSpecItem = tuple[str, slice] | tuple[str, Literal['se3_matrix']] | tuple[float, int]
+MergeSpec = Sequence[MergeSpecItem]
 
 MERGE_SPECS = {
     'agibot_world': (
@@ -54,6 +55,29 @@ MERGE_SPECS = {
     ),
 }
 
+def _make_merge_segment(
+    inst: dict[str, Any],
+    merge_prefix: str,
+    merge_spec_item: MergeSpecItem,
+    leading_dims: tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    match merge_spec_item:
+        case (str() as feat, slice() as dims):
+            return inst[f"{merge_prefix}.{feat}"][..., dims]
+        case (str() as feat, 'se3_matrix'):
+            # flatten based on leading dimensions, this can handle
+            # both the SE(3) matrix form (raw action / state) and the XYZ and angles form (norm stats)
+            return inst[f"{merge_prefix}.{feat}"].view(*leading_dims, -1)
+        case (float() as fill_value, int() as n_dims):
+            return torch.full(
+                (*leading_dims, n_dims),
+                fill_value = fill_value,
+                device = device,
+            )
+        case _:
+            raise ValueError(f"Invalid merge spec: {merge_spec_item}")
+
 def merge_features(
     inst: dict[str, Any],
     merge_prefix: str,
@@ -71,13 +95,12 @@ def merge_features(
 
     The merge output is a single tensor with the concatenated features dimensions.
     """
-    first_feature = next(feat for feat, _ in merge_spec if feat is not None)
-    first_feature_tensor = inst[f"{merge_prefix}.{first_feature}"]
-    leading_dims = first_feature_tensor.shape[:-1]
+    first_spec_item = next(item for item in merge_spec if item[0] is not None)
+    first_feature_tensor = inst[f"{merge_prefix}.{first_spec_item[0]}"]
+    leading_dims = first_feature_tensor.shape[:-1 if first_spec_item[1] != 'se3_matrix' else -2]
     to_cat = [
-        inst[f"{merge_prefix}.{feat}"][..., dims] if isinstance(feat, str) \
-            else torch.full((*leading_dims, dims), fill_value = feat, device = first_feature_tensor.device)
-        for feat, dims in merge_spec
+        _make_merge_segment(inst, merge_prefix, merge_spec_item, leading_dims, first_feature_tensor.device)
+        for merge_spec_item in merge_spec
     ]
 
     new_inst = {k: v for k, v in inst.items() if not k.startswith(merge_prefix + '.')}
