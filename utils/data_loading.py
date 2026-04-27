@@ -302,6 +302,14 @@ def load_task_config(task_root: pathlib.Path) -> dict[str, Any] | None:
         return json.load(f)
 
 
+DEFAULT_DELTA_TRANSFORM_MASK = torch.tensor(
+    [
+        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
+    ],
+    dtype=torch.bool,
+)
+
 def load_dataset(
     root: str | pathlib.Path,
     action_keys: Iterable[str],
@@ -311,6 +319,7 @@ def load_dataset(
     instance_transform: Callable[..., dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
     se3_segment_start_idxs: Set[int] | None = None,
+    delta_transform_mask: torch.Tensor | None = None,
     num_frames: int = 1,
 ) -> Dataset:
     """
@@ -380,13 +389,7 @@ def load_dataset(
 
     processor_steps = [
         Abs2DeltaActionProcessorStep(
-            mask=torch.tensor(
-                [
-                    True, True, True, True, True, True, True, False,
-                    True, True, True, True, True, True, True, False,
-                ],
-                dtype=torch.bool,
-            ),
+            mask = delta_transform_mask if delta_transform_mask is not None else DEFAULT_DELTA_TRANSFORM_MASK,
             se3_segment_start_idxs = se3_segment_start_idxs,
         ),
         *convert_se3_if_necessary,

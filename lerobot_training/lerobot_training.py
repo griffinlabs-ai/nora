@@ -52,8 +52,9 @@ class TrainingConfig:
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
     agibot_world_root: str = "data/agibot-world/tasks"
-    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
+    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset/subsets"
     interndata_a1_root: str = "data/interndata-a1/"
+    egodex_root: str = "data/egodex/train"
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
@@ -382,7 +383,12 @@ def train(config: TrainingConfig):
         canonical_action_chunk_size = config.action_chunk_size,
         num_frames = config.num_frames, 
     )
-    dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
+    egodex = load_datasets.load_egodex_dataset(
+        root = config.egodex_root,
+        canonical_action_chunk_size = config.action_chunk_size,
+        num_frames = config.num_frames, 
+    )
+    dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1, egodex])
     accelerator.print(f"Total number of frames in dataset: {len(dataset)}")
 
     with accelerator.main_process_first():
