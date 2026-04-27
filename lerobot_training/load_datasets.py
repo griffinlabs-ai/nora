@@ -4,8 +4,10 @@ from typing import Any, Iterable
 import torch
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
+from datasets import load_dataset as hf_load_dataset, concatenate_datasets, Image as HFImage
 
 import numpy as np
+import PIL # Imported for specific exception handling
 
 ACTION_DIM_IS_PAD = {
     'dual_arm_7dof': torch.zeros(16, dtype=torch.bool),
@@ -337,3 +339,83 @@ def load_interndata_a1_dataset(
         num_frames = num_frames
     )
     return ConcatDataset([*franka_datasets, genie1_dataset, lift2_dataset, split_aloha_dataset])
+
+
+# ==========================================
+# --- Math VL Dataset Loading ---
+# ==========================================
+
+def _standardize_math_format(example, img_col, inst_col, ans_col):
+    """Formats raw HuggingFace dataset items into the unified schema."""
+    img_data = example.get(img_col)
+    image = None
+    
+    try:
+        if img_data is not None:
+            if isinstance(img_data, list):
+                img_data = img_data[0] if len(img_data) > 0 else None
+            
+            if hasattr(img_data, "convert"):
+                image = img_data.convert('RGB')
+    # Replaced bare Exception with specific exceptions to prevent masking other bugs
+    except (OSError, ValueError, TypeError, PIL.UnidentifiedImageError):
+        image = None
+
+    return {
+        "image": image,
+        "instruction": str(example.get(inst_col, "")),
+        "text_answer": str(example.get(ans_col, "")),
+        "task_type": "vl_math"
+    }
+
+def _load_single_math_dataset(repo_id: str, split: str, img_col: str, inst_col: str, ans_col: str, num_samples: int):
+    """
+    Loads a single dataset and selects the specified number of samples.
+    Applies the DRY principle and removes soft-failures. It will fail loudly if the dataset is missing.
+    """
+    ds = hf_load_dataset(repo_id, split=split)
+    
+    ds = ds.map(
+        lambda x: _standardize_math_format(x, img_col, inst_col, ans_col),
+        remove_columns=ds.column_names
+    ).filter(lambda x: x["image"] is not None)
+    
+    actual_samples = min(num_samples, len(ds))
+    ds = ds.select(range(actual_samples))
+    
+    if len(ds) > 0:
+        ds = ds.cast_column("image", HFImage())
+        
+    return ds
+
+def load_math_reasoning_datasets(samples_per_dataset: int = 50000):
+    """
+    Loads and standardizes mathematical reasoning datasets from Hugging Face.
+    Converts various dataset formats into a unified schema:
+    {'image': PIL.Image, 'instruction': str, 'text_answer': str, 'task_type': 'vl_math'}
+    """
+    # Dataset configurations for DRY looping
+    datasets_config = [
+        ("MathLLMs/MathVision", "test", "image", "question", "answer"),
+        ("AI4Math/MathVista", "testmini", "decoded_image", "query", "answer"),
+        ("WaltonFuture/clevr-math", "train", "images", "problem", "answer"),
+        ("leonardPKU/GEOQA_8K_R1V", "train", "images", "problem", "answer")
+    ]
+    
+    standardized_datasets = []
+    
+    for repo_id, split, img_col, inst_col, ans_col in datasets_config:
+        # Fails fast if any dataset is unavailable (no try-except wrappers)
+        ds = _load_single_math_dataset(
+            repo_id=repo_id,
+            split=split,
+            img_col=img_col,
+            inst_col=inst_col,
+            ans_col=ans_col,
+            num_samples=samples_per_dataset
+        )
+        standardized_datasets.append(ds)
+
+    mixed_math_dataset = concatenate_datasets(standardized_datasets)
+    mixed_math_dataset = mixed_math_dataset.shuffle(seed=42)
+    return mixed_math_dataset
