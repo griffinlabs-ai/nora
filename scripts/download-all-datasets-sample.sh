@@ -32,3 +32,12 @@ hf download \
     lift2/long_horizon_tasks/clean_the_dirt_with_brown_cloth_left_arm/ \
     split_aloha/pick_and_place_tasks/parallel_pick_and_place/basket_top/ \
     '**/delta_norm_stats.json'
+
+# EgoDex
+hf download \
+    --repo-type dataset \
+    --local-dir ./data/egodex \
+    --revision simplified \
+    yixuan-tan/EgoDex-LeRobot-v3.0 \
+    train/fry_bread/ \
+    train/delta_norm_stats.json
