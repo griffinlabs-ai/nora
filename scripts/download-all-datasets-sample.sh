@@ -24,6 +24,7 @@ mv \
 hf download \
     --repo-type dataset \
     --local-dir ./data/interndata-a1 \
+    --revision simplified \
     yixuan-tan/InternData-A1-LeRobot-v3.0-by-embodiment \
     franka-1/articulation_tasks/close_the_electriccooker/ \
     franka-2/basic_tasks/pick_the_object_into_trashcan/ \
