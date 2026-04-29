@@ -11,7 +11,7 @@ if str(_root) not in sys.path:
 import math
 import os
 import logging
-from typing import List, Any, Optional, Tuple
+from typing import List, Any, Optional, Tuple, Dict
 from dataclasses import dataclass
 
 import torch
@@ -30,7 +30,7 @@ from lerobot.configs.types import PipelineFeatureType
 from tqdm import tqdm
 
 import load_datasets
-from utils.data_loading import collate_with_observation_image_lists
+from utils.data_loading import build_co_training_dataloader, collate_with_observation_image_lists
 
 logger = get_logger(__name__)
 
@@ -65,8 +65,13 @@ class TrainingConfig:
     # Number of frames to input (5 past + 1 current = 6)
     num_frames: int = 6
     
-    # [Resolved from refactor branch] Flag for image augmentation
+    # Flag for image augmentation
     image_augmentation: bool = False
+
+    # --- New Config for Math VL Data ---
+    math_vl_mixing_ratio: float = 0.2  # Mix 20% Math VL data
+    
+    math_vl_samples_per_dataset: Optional[int] = None 
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -138,59 +143,91 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             raise ValueError("Action Tokens not found in the Gemma vocabulary!")
 
         self.nora_image_transform = NoraImageTransform()
-
-    def __call__(self, transition) -> lerobot.processor.EnvTransition:
-        batch_size = transition['action'].shape[0]
-        obs_dict = transition['observation'] if 'observation' in transition else transition
+    def _process_robot_data(self, batch: lerobot.processor.EnvTransition, i: int, imgs_for_this_sample: List):
+        first_cam = batch['observation.images.head'][i]
+        T = first_cam.shape[0] if first_cam.dim() == 4 else 1
         
+        # Extract historical frames and apply Transform
+        for t in range(T):
+            for k in self.IMAGE_KEYS:
+                img_list = batch.get(k)
+                if img_list is not None and img_list[i] is not None:
+                    img_tensor = img_list[i]
+                    frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
+                    transformed_frame = self.nora_image_transform(frame)
+                    imgs_for_this_sample.append(transformed_frame)
+
+        # Extract Action Tokens
+        action = batch['action'][i]
+        action_dim_is_pad = batch['action_dim_is_pad'][i]
+        action = action[:, action_dim_is_pad.logical_not()] if action.dim() == 2 else action[action_dim_is_pad.logical_not()]
+        fast_tokens = self.fast_tokenizer(action.cpu())[0]
+        vlm_action = map_fast_token_to_vlm_action(fast_tokens)
+        
+        task = batch['task'][i]
+        embodiment = batch['info'][i].get('embodiment_prompt', 'Generic Robot')
+
+        content = [{"type": "text", "text": f"[embodiment: {embodiment}]\n"}]
+        for _ in imgs_for_this_sample:
+            content.append({"type": "image"})
+        content.append({"type": "text", "text": task})
+
+        messages = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": [{"type": "text", "text": vlm_action}]}
+        ]
+        return messages, imgs_for_this_sample
+    def _process_math_vl_data(self, batch: lerobot.processor.EnvTransition, i: int, imgs_for_this_sample: List):
+        head_img = batch['observation.images.head'][i]
+        if head_img is not None:
+            # Revert unsqueeze(0) if present depending on how pure collate works
+            frame = head_img[0] if head_img.dim() == 4 else head_img
+            imgs_for_this_sample.append(frame)
+
+        task_instruction = batch['task'][i]
+        comp_data = batch['complementary_data'][i] if batch.get('complementary_data') else {}
+        text_answer = comp_data.get('text_answer', '')
+
+        content = []
+        for _ in imgs_for_this_sample:
+            content.append({"type": "image"})
+        content.append({"type": "text", "text": task_instruction})
+
+        messages = [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": [{"type": "text", "text": text_answer}]}
+        ]
+        return messages, imgs_for_this_sample
+    def __call__(self, batch: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
+        """Processes a single batched EnvTransition."""
+        batch_size = len(batch['task'])
         text_prompts = []
         batch_images = []
+        is_robot_flags = []
+        messages_list = []
         
-        # 1. Process images and construct text prompts
+        # 1. Route batched items to Robot Pipeline or Math VL Pipeline
         for i in range(batch_size):
             imgs_for_this_sample = []
-            
-            first_cam = obs_dict[self.IMAGE_KEYS[0]][i]
-            T = first_cam.shape[0] if first_cam.dim() == 4 else 1
-            
-            # Extract historical frames and apply Transform
-            for t in range(T):
-                for k in self.IMAGE_KEYS:
-                    img_tensor = obs_dict[k][i]
-                    if img_tensor is not None:
-                        frame = img_tensor[t] if img_tensor.dim() == 4 else img_tensor
-                        transformed_frame = self.nora_image_transform(frame)
-                        imgs_for_this_sample.append(transformed_frame)
-            
+            task_type = batch['info'][i].get('task_type', 'robot')
+            is_robot = (task_type != 'vl_math')
+            is_robot_flags.append(is_robot)
+
+            if is_robot:
+                messages, imgs_for_this_sample = self._process_robot_data(batch, i, imgs_for_this_sample)
+            else:
+                messages, imgs_for_this_sample = self._process_math_vl_data(batch, i, imgs_for_this_sample)
+
             batch_images.append(imgs_for_this_sample)
+            messages_list.append(messages)
 
-            # 2. Extract Action Tokens
-            action = transition['action'][i]
-            action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
-            fast_tokens = self.fast_tokenizer(action.cpu())[0]
-            vlm_action = map_fast_token_to_vlm_action(fast_tokens)
-            
-            task = transition['complementary_data']['task'][i]
-            embodiment = transition['info']['embodiment_prompt'][i]
-
-            # 3. Construct the message with image placeholders ONLY
-            content = [{"type": "text", "text": f"[embodiment: {embodiment}]\n"}]
-            for _ in imgs_for_this_sample:
-                content.append({"type": "image"})
-            content.append({"type": "text", "text": task})
-
-            messages = [
-                {"role": "user", "content": content},
-                {"role": "assistant", "content": [{"type": "text", "text": vlm_action}]}
-            ]
-            
             # Get purely textual prompt with <image> placeholders
             prompt = self.transformer_processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=False
             )
             text_prompts.append(prompt)
 
-        # 4. Pass separated text and images into the processor
+        # 2. Pass separated text and images into the processor
         batch_input = self.transformer_processor(
             text=text_prompts,
             images=batch_images,
@@ -199,20 +236,36 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         )
         
         labels = batch_input['input_ids'].clone()
+        pad_token_id = self.transformer_processor.tokenizer.pad_token_id
 
-        # Mask out everything before the action tokens to calculate loss only on actions
-        for i in range(labels.size(0)):
+        # 3. Dynamic Loss Masking
+        for i in range(batch_size):
             seq = labels[i]
-            mask_seq = (seq >= self.action_token_min) & (seq <= self.action_token_max)
-            nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
-            if nonzero_indices.numel() > 0:
-                first_action_index = nonzero_indices[0].item()
-                seq[:first_action_index] = -100
+            if is_robot_flags[i]:
+                # Robot: Mask out everything before the action tokens
+                mask_seq = (seq >= self.action_token_min) & (seq <= self.action_token_max)
+                nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
+                if nonzero_indices.numel() > 0:
+                    first_action_index = nonzero_indices[0].item()
+                    seq[:first_action_index] = -100
+                else:
+                    seq[:] = -100
             else:
-                seq[:] = -100
+                # Math VL: Dynamically find the prompt length and mask it to isolate answer loss
+                prompt_messages = [messages_list[i][0]] # User message only
+                prompt_str = self.transformer_processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+                
+                # Tokenize prefix to get its length
+                prefix_inputs = self.transformer_processor(text=[prompt_str], images=[batch_images[i]] if batch_images[i] else None, return_tensors="pt")
+                prefix_len = prefix_inputs['input_ids'].shape[1]
+                
+                pad_count = (seq == pad_token_id).sum().item() if pad_token_id is not None else 0
+                if self.transformer_processor.tokenizer.padding_side == 'left':
+                    seq[:pad_count + prefix_len] = -100
+                else:
+                    seq[:prefix_len] = -100
 
         # Mask out padding tokens
-        pad_token_id = self.transformer_processor.tokenizer.pad_token_id
         if pad_token_id is not None:
             labels[labels == pad_token_id] = -100
             
@@ -304,7 +357,6 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 
     return model, transformer_processor
 
-
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
@@ -332,16 +384,29 @@ def train(config: TrainingConfig):
             canonical_action_chunk_size = config.action_chunk_size,
             num_frames = config.num_frames, 
         )
-        dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
+        
+        # Merge robot datasets
+        robot_dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
+        
+        # Load new Math VL dataset (now correctly defaults to full dataset)
+        math_vl_dataset = load_datasets.load_math_reasoning_datasets(
+            samples_per_dataset=config.math_vl_samples_per_dataset
+        )
+        
         policy_preprocessor = make_policy_processor(config, transformer_processor)
+    def composed_collate_fn(instances: List[Dict]):
+        # The imported original pure collator only batches
+        batched_transition = collate_with_observation_image_lists(instances)
+        # Process handles EnvTransition
+        return policy_preprocessor(batched_transition)
 
-    train_dataloader = DataLoader(
-        dataset,
+    train_dataloader = build_co_training_dataloader(
+        robot_dataset=robot_dataset,
+        math_hf_dataset=math_vl_dataset,
         batch_size=config.per_device_batch_size,
-        collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
-        shuffle=True,
-        num_workers=config.dataloader_num_workers,
-        pin_memory=True,
+        policy_processor=composed_collate_fn, 
+        robot_ratio=(1.0 - config.math_vl_mixing_ratio), 
+        num_workers=config.dataloader_num_workers
     )
 
     optimizer = torch.optim.AdamW(
@@ -372,7 +437,7 @@ def train(config: TrainingConfig):
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(dataset)}")
+    logger.info(f"  Num examples = {len(train_dataloader.dataset)}")
     logger.info(f"  Num steps = {max_train_steps}")
     logger.info(f"  Instantaneous batch size per device = {config.per_device_batch_size}")
     logger.info(f"  Total train batch size = {total_batch_size}")

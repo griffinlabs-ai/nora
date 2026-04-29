@@ -1,20 +1,18 @@
 from dataclasses import dataclass
 import json
-from typing import Callable, Generic, Iterable, Mapping
-from scipy.interpolate import CubicSpline
-import torch
-from torch.utils.data import Dataset, default_collate
-from typing import Any
 import pathlib
 import numpy as np
-from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
-import lerobot.processor
-import lerobot.datasets.io_utils
-from torch.utils.data import ConcatDataset
+from typing import Callable, Generic, Iterable, Mapping, Any
+
+import torch
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler, default_collate
+from scipy.interpolate import CubicSpline
 from tqdm import tqdm
 
+import lerobot.processor
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
+from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 class PreprocessedDataset(Dataset, Generic[TOutput]):
 
@@ -34,9 +32,7 @@ class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
     """
     Resample the action tensor from one chunk size to another, by cubic spline interpolation.
     """
-
     target_chunk_size: int
-
     state_key: str | None = None
     """
     Key for the state tensor that corresponds to the action tensor.
@@ -95,13 +91,11 @@ class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
     Expects an action shape of [..., chunk_size, degrees_of_freedom].
     Expects transition to have a state tensor in the same vector space as the action tensor.
     """
-
     mask: torch.Tensor
     """
     Mask of which action tensor dimensions to convert to delta space.
     `True` dimensions output delta space, `False` dimensions keep absolute space.
     """
-
     state_key: str = 'observation.state'
     """
     Key for the state tensor that corresponds to the action tensor.
@@ -109,7 +103,6 @@ class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
 
     def __call__(self, transition):
         new_transition = transition.copy()
-
         action = transition['action']
 
         assert self.mask.shape[-1] == action.shape[-1]
@@ -156,7 +149,6 @@ def load_dataset(
     """
     root = pathlib.Path(root)
 
-    # 1. Action timestamps (Future prediction chunk)
     action_delta_timestamps = [i / raw_fps for i in range(load_action_chunk_size)]
     delta_timestamps = {
         action_key: action_delta_timestamps
@@ -165,20 +157,13 @@ def load_dataset(
     
     task_roots = [p.parent.parent for p in root.rglob('info.json')]
 
-    # 2. Image timestamps (Past observation history)
-    # We dynamically find the image keys from the first dataset to apply history frames
     if task_roots and num_frames > 1:
-        
         repo_id = str(task_roots[0].relative_to(root))
         meta = LeRobotDatasetMetadata(repo_id, root=task_roots[0])
         
-        # Find all keys that represent images
         image_keys = [k for k in meta.features.keys() if 'image' in k.lower()]
-        
-        # Calculate timestamps for 5 past frames + 1 current frame
         img_timestamps = [float(i - num_frames + 1) for i in range(num_frames)]
         
-        # Apply the temporal window to all image streams
         for img_k in image_keys:
             delta_timestamps[img_k] = img_timestamps
 
@@ -191,14 +176,10 @@ def load_dataset(
         for task_root in tqdm(task_roots, desc="Loading datasets")
     ])
     
-    # Load and prepare normalization stats
     raw_norm_stats = lerobot.datasets.io_utils.cast_stats_to_numpy(
         lerobot.datasets.io_utils.load_json(root / 'delta_norm_stats.json')
     )['norm_stats']
     
-    # gripper min and max are currently hardcoded to 0 and 1.
-    # if changing this to use other statistics, remember that gripper states are all transformed by 1-x,
-    # so the stats would have to be transformed as well, and order reversed (e.g. q01 becomes 1-q99)
     norm_stats = norm_stats_transform(raw_norm_stats)
 
     norm_map = {
@@ -228,31 +209,53 @@ def load_dataset(
     )
 
     dataset = PreprocessedDataset(dataset, preprocessor)
-
     return dataset
 
-def collate_with_observation_image_lists(
-    examples: Mapping[str, Any],
-) -> Mapping[str, Any]:
-    """
-    Collate function that collates `observation.images.*` fields as lists rather than tensors.
 
-    This allows for heterogeneous image shapes in the batch.
+def build_co_training_dataloader(
+    robot_dataset: Dataset, 
+    math_hf_dataset: Dataset, 
+    batch_size: int, 
+    policy_processor, # This must be the NoraPolicyProcessorPipeline
+    robot_ratio: float = 0.8,
+    num_workers: int = 4
+):
     """
-    images = [
-        {k: v for k, v in example.items() if k.startswith('observation.images.')}
-        for example in examples
-    ]
-    collated_images = {
-        k: [observation[k] for observation in images]
-        for k in images[0].keys()
-    }
-    no_images = [
-        {k: v for k, v in example.items() if not k.startswith('observation.images.')}
-        for example in examples
-    ]
-    collated = {
-        **collated_images,
-        **default_collate(no_images)
-    }
-    return collated
+    Creates a DataLoader that mixes robotics data and math reasoning data.
+    Instead of item-level tokenization, this passes the raw batch to the policy_processor
+    to utilize Gemma's native batched padding and tile positioning (in one go).
+    """
+    
+    # 1. Directly concatenate the raw datasets (No Wrapper Needed!)
+    combined_dataset = ConcatDataset([robot_dataset, math_hf_dataset])
+    
+    # 2. Calculate weights for WeightedRandomSampler
+    total_robot_len = len(robot_dataset)
+    total_math_len = len(math_hf_dataset)
+    
+    weight_robot = robot_ratio / total_robot_len if total_robot_len > 0 else 0
+    weight_math = (1.0 - robot_ratio) / total_math_len if total_math_len > 0 else 0
+    
+    sample_weights = (
+        [weight_robot] * total_robot_len + 
+        [weight_math] * total_math_len
+    )
+    
+    # 3. Build Sampler
+    sampler = WeightedRandomSampler(
+        weights=sample_weights, 
+        num_samples=len(combined_dataset), 
+        replacement=True 
+    )
+    
+    # 4. Build Dataloader
+    dataloader = DataLoader(
+        combined_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=lambda raw_batch: policy_processor(raw_batch)
+    )
+    
+    return dataloader
