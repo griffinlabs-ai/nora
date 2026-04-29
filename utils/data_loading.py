@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import functools
 import json
 from typing import Callable, Generic, Iterable, Mapping
 from scipy.interpolate import CubicSpline
@@ -11,7 +12,7 @@ from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import lerobot.processor
 import lerobot.datasets.io_utils
-from torch.utils.data import ConcatDataset
+from torch.utils.data import ConcatDataset, Dataset
 from tqdm import tqdm
 
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
@@ -127,7 +128,7 @@ def load_lerobot_dataset_skip_dirty_episodes(
     episodes: list[int] | None = None,
     *args,
     **kwargs,
-) -> PreprocessedDataset:
+) -> LeRobotDataset:
     if episodes is None and root is not None:
         removed_episodes_path = pathlib.Path(root) / 'meta/removed_episodes.json'
         if removed_episodes_path.exists():
@@ -137,22 +138,36 @@ def load_lerobot_dataset_skip_dirty_episodes(
             episodes = [i for i in range(total_episodes) if i not in removed_episodes]
     return LeRobotDataset(repo_id, root, episodes, *args, **kwargs)
 
+
+def load_task_config(task_root: pathlib.Path) -> dict[str, Any] | None:
+    path = task_root / "meta" / "task_config.json"
+    if not path.is_file():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_dataset(
     root: str | pathlib.Path,
     action_keys: Iterable[str],
     load_action_chunk_size: int,
     canonical_action_chunk_size: int,
     raw_fps: int,
-    instance_transform: Callable[[dict[str, Any]], dict[str, Any]],
+    instance_transform: Callable[..., dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
-    num_frames: int = 1, 
-) -> PreprocessedDataset:
+    num_frames: int = 1,
+) -> Dataset:
     """
-    Loads preprocessed dataset. The following preprocessing steps are applied:
-    - Transform the instance from the raw dataset to the desired format (by the `instance_transform` param).
-    - Convert action tensor from absolute space to delta space.
-    - Resample the action tensor from one chunk size to another if necessary.
-    - Normalize the action tensor.
+    Loads an aggregated dataset from a root directory.
+
+    ``instance_transform`` must accept ``(batch, *, meta: LeRobotDatasetMetadata, task_config: dict | None)``.
+
+    All ``PreprocessedDataset`` leaves share the same ``shared_processor_steps`` list (same step
+    instances); only ``to_transition`` / per-root ``instance_transform`` differ.
+
+    Preprocessing per sample:
+    - Instance transform (dataset-specific merge, subtask, etc.).
+    - Absolute to delta actions, optional resample, normalization.
     """
     root = pathlib.Path(root)
 
@@ -182,15 +197,6 @@ def load_dataset(
         for img_k in image_keys:
             delta_timestamps[img_k] = img_timestamps
 
-    dataset = ConcatDataset([
-        load_lerobot_dataset_skip_dirty_episodes(
-            task_root.relative_to(root),
-            root=task_root,
-            delta_timestamps=delta_timestamps, 
-        )
-        for task_root in tqdm(task_roots, desc="Loading datasets")
-    ])
-    
     # Load and prepare normalization stats
     raw_norm_stats = lerobot.datasets.io_utils.cast_stats_to_numpy(
         lerobot.datasets.io_utils.load_json(root / 'delta_norm_stats.json')
@@ -204,32 +210,48 @@ def load_dataset(
     norm_map = {
         'ACTION': NormalizationMode.QUANTILES,
     }
-    
-    resample_step_if_necessary = [ResampleActionProcessorStep(
-        target_chunk_size = canonical_action_chunk_size,
-    )] if load_action_chunk_size != canonical_action_chunk_size else []
-    
-    preprocessor = PolicyProcessorPipeline(
-        steps = [
-            Abs2DeltaActionProcessorStep(
-                mask = torch.tensor(
-                    [
-                        True, True, True, True, True, True, True, False,
-                        True, True, True, True, True, True, True, False,
-                    ],
-                    dtype=torch.bool,
-                )
+
+    resample_step_if_necessary = [
+        ResampleActionProcessorStep(
+            target_chunk_size=canonical_action_chunk_size,
+        )
+    ] if load_action_chunk_size != canonical_action_chunk_size else []
+    processor_steps = [
+        Abs2DeltaActionProcessorStep(
+            mask=torch.tensor(
+                [
+                    True, True, True, True, True, True, True, False,
+                    True, True, True, True, True, True, True, False,
+                ],
+                dtype=torch.bool,
+            )
+        ),
+        *resample_step_if_necessary,
+        lerobot.processor.NormalizerProcessorStep({}, norm_map, norm_stats),
+    ]
+
+    preprocessed_subsets: list[PreprocessedDataset] = []
+    for task_root in tqdm(task_roots, desc=f"Loading ds — {root}"):
+        lerobot_ds = load_lerobot_dataset_skip_dirty_episodes(
+            str(task_root.relative_to(root)),
+            root=task_root,
+            delta_timestamps=delta_timestamps,
+        )
+        task_config = load_task_config(task_root)
+        subset_inst_transform = functools.partial(
+            instance_transform,
+            meta=lerobot_ds.meta,
+            task_config=task_config,
+        )
+        preprocessor = PolicyProcessorPipeline(
+            steps=processor_steps,
+            to_transition=lambda b: lerobot.processor.converters.batch_to_transition(
+                subset_inst_transform(b)
             ),
-            *resample_step_if_necessary,
-            lerobot.processor.NormalizerProcessorStep({}, norm_map , norm_stats),
-        ],
-        to_transition=lambda batch:
-            lerobot.processor.converters.batch_to_transition(instance_transform(batch)),
-    )
+        )
+        preprocessed_subsets.append(PreprocessedDataset(lerobot_ds, preprocessor))
 
-    dataset = PreprocessedDataset(dataset, preprocessor)
-
-    return dataset
+    return ConcatDataset(preprocessed_subsets)
 
 def collate_with_observation_image_lists(
     examples: Mapping[str, Any],

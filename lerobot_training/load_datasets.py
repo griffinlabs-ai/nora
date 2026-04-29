@@ -1,11 +1,11 @@
 import functools
 import pathlib
 from typing import Any, Iterable
+import numpy as np
 import torch
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
-
-import numpy as np
 
 ACTION_DIM_IS_PAD = {
     'dual_arm_7dof': torch.zeros(16, dtype=torch.bool),
@@ -53,6 +53,23 @@ MERGE_SPECS = {
         ('right_gripper.position', slice(None)),
     ),
 }
+
+def _agibot_subtask_from_meta(
+    meta: LeRobotDatasetMetadata,
+    episode_index: int,
+    frame_index: int,
+) -> str:
+    ep_row = meta.episodes[episode_index]
+    segments = ep_row.get("action_config")
+    if not segments:
+        return ""
+    for seg in segments:
+        sf, ef = seg.get("start_frame"), seg.get("end_frame")
+        if sf is None or ef is None:
+            continue
+        if int(sf) <= frame_index < int(ef):
+            return seg.get("action_text") or ""
+    return ""
 
 def merge_features(
     inst: dict[str, Any],
@@ -115,16 +132,27 @@ def generic_to_nora_instance(
     batch = merge_features(batch, state_prefix, merge_spec, 'observation.state')
     batch['action_dim_is_pad'] = action_dim_is_pad
     batch['info'] = {"embodiment_prompt": embodiment_prompt}
+    if 'subtask' not in batch:
+        batch['subtask'] = ""
     return batch
 
-def agibot_world_to_nora_instance(batch: dict[str, Any]):
+def agibot_world_to_nora_instance(
+    batch: dict[str, Any],
+    *,
+    meta: LeRobotDatasetMetadata,
+    task_config: object = None,
+):
     """
     Convert from raw AgiBot World dataset format to format that is ready to be converted to `EnvTransition`:
     - Merge relevant actions into `action`, discarding other actions.
     - Merge relevant states into `observation.state`, discarding other states.
     - Invert the gripper action by 1-x.
+    - Subtask from episode `action_config` when the current frame falls in a segment.
     """
     batch['actions.effector.position'] = 1 - batch['actions.effector.position']
+    ep_idx = batch['episode_index'].item()
+    frame_idx = batch['frame_index'].item()
+    batch['subtask'] = _agibot_subtask_from_meta(meta, ep_idx, frame_idx)
     return generic_to_nora_instance(
         batch,
         merge_spec = MERGE_SPECS['agibot_world'],
@@ -134,16 +162,38 @@ def agibot_world_to_nora_instance(batch: dict[str, Any]):
         embodiment_prompt = "AgiBot G1 with 2 grippers",
     )
 
-def galaxea_to_nora_instance(batch: dict[str, Any]):
+def galaxea_to_nora_instance(
+    batch: dict[str, Any],
+    *,
+    meta: LeRobotDatasetMetadata,
+    task_config: dict[str, Any] | None = None,
+):
     """
     Convert from raw Galaxea Open World Dataset format to format that is ready to be converted to `EnvTransition`:
     - Merge relevant actions into `action`, discarding other actions.
     - Merge relevant states into `observation.state`, discarding other states.
+    - Conditional subtask setup based on task config.
     """
     batch['observation.state.left_gripper'] = batch['observation.state.left_gripper'].view(-1)
     batch['observation.state.right_gripper'] = batch['observation.state.right_gripper'].view(-1)
     batch['action.left_gripper'] = batch['action.left_gripper'].view(-1, 1)
     batch['action.right_gripper'] = batch['action.right_gripper'].view(-1, 1)
+
+    task_config = task_config or {}
+    fine_task = batch['task'].split('@')[-1]    # keep the English part ("[chinese task]@[english task]")
+    if fine_task == 'null':
+        fine_task = ""
+    if task_config.get('coarse_task_as_main_task'):
+        coarse_task = task_config.get('rename_coarse_task')
+        if not coarse_task:
+            coarse_task_idx = batch['coarse_task_index'].item()
+            coarse_task = meta.tasks.iloc[coarse_task_idx].name
+        batch['task'] = coarse_task
+        batch['subtask'] = fine_task
+    else:
+        batch['task'] = fine_task
+        batch['subtask'] = ""
+
     batch = generic_to_nora_instance(
         batch,
         merge_spec = MERGE_SPECS['galaxea'],
@@ -174,6 +224,9 @@ def interndata_a1_to_nora_instance(
     merge_spec: MergeSpec,
     action_dim_is_pad: torch.Tensor,
     embodiment_prompt: str,
+    *,
+    meta: object = None,
+    task_config: object = None,
 ):
     for key in batch:
         if key.startswith('states.') and key.endswith('gripper.position'):
@@ -211,7 +264,12 @@ interndata_a1_split_aloha_to_nora_instance = functools.partial(
     embodiment_prompt = "InternData-A1 simulated Split Aloha with 2 Piper-100 arms",
 )
 
-def interndata_a1_franka_to_nora_instance(batch: dict[str, Any]):
+def interndata_a1_franka_to_nora_instance(
+    batch: dict[str, Any],
+    *,
+    meta: object = None,
+    task_config: object = None,
+):
     batch = interndata_a1_to_nora_instance(
         batch,
         merge_spec = MERGE_SPECS['interndata_a1_franka'],
