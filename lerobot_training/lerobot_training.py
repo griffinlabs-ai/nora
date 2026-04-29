@@ -30,7 +30,7 @@ from lerobot.configs.types import PipelineFeatureType
 from tqdm import tqdm
 
 import load_datasets
-from utils.data_loading import build_co_training_dataloader
+from utils.data_loading import build_co_training_dataloader, collate_with_observation_image_lists
 
 logger = get_logger(__name__)
 
@@ -70,9 +70,8 @@ class TrainingConfig:
 
     # --- New Config for Math VL Data ---
     math_vl_mixing_ratio: float = 0.2  # Mix 20% Math VL data
-
-    # Default to 50000 for actual training. Use 50 only for local dry-runs/CI testing.
-    math_vl_samples_per_dataset: int = 50000 
+    
+    math_vl_samples_per_dataset: Optional[int] = None 
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -113,59 +112,6 @@ class NoraImageTransform:
         return image
 
 
-def collate_with_observation_image_lists(instances: List[Dict]) -> Dict:
-    """
-    Formats mixed instances (Robot and VL Math) into a uniform EnvTransition shape 
-    and collates them into a single batch.
-    """
-    batch = {
-        'observation.images.head': [],
-        'observation.images.hand_left': [],
-        'observation.images.hand_right': [],
-        'action': [],
-        'action_dim_is_pad': [],
-        'task': [],
-        'info': [],
-        'complementary_data': []
-    }
-    
-    for item in instances:
-        is_math = item.get('task_type') == 'vl_math' or 'instruction' in item
-        
-        if is_math:
-            # Format VL Math instance into EnvTransition shape
-            img = item.get('image')
-            batch['observation.images.head'].append(img.unsqueeze(0) if img is not None else None)
-            batch['observation.images.hand_left'].append(None) # Placeholder filler
-            batch['observation.images.hand_right'].append(None) # Placeholder filler
-            
-            # Filler action tensor to keep shape uniform
-            batch['action'].append(torch.zeros((1, 14))) 
-            batch['action_dim_is_pad'].append(torch.zeros(14, dtype=torch.bool))
-            
-            batch['task'].append(item.get('instruction', ''))
-            batch['info'].append({'task_type': 'vl_math', 'embodiment_prompt': 'None'})
-            batch['complementary_data'].append({'text_answer': item.get('text_answer', '')})
-        else:
-            # Standard Robot Data formatting
-            batch['observation.images.head'].append(item.get('observation.images.head'))
-            batch['observation.images.hand_left'].append(item.get('observation.images.hand_left'))
-            batch['observation.images.hand_right'].append(item.get('observation.images.hand_right'))
-            
-            batch['action'].append(item.get('action'))
-            action_dim = item['action'].shape[-1]
-            batch['action_dim_is_pad'].append(item.get('action_dim_is_pad', torch.zeros(action_dim, dtype=torch.bool)))
-            
-            info_dict = item.get('info', {})
-            batch['task'].append(info_dict.get('task', 'Execute robot trajectory'))
-            batch['info'].append(info_dict)
-            batch['complementary_data'].append(item.get('complementary_data', {}))
-
-    # Keep action/pad as lists instead of torch.stack to gracefully handle chunk size mismatches
-    # between Math fillers (1x14) and Robot trajectories (e.g. 50x14).
-    return batch
-
-
 @dataclass
 @lerobot.processor.ProcessorStepRegistry.register("nora_processor")
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
@@ -197,8 +143,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             raise ValueError("Action Tokens not found in the Gemma vocabulary!")
 
         self.nora_image_transform = NoraImageTransform()
-
-    def _process_robot_data(self, batch: Dict, i: int, imgs_for_this_sample: List):
+    def _process_robot_data(self, batch: lerobot.processor.EnvTransition, i: int, imgs_for_this_sample: List):
         first_cam = batch['observation.images.head'][i]
         T = first_cam.shape[0] if first_cam.dim() == 4 else 1
         
@@ -232,11 +177,10 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             {"role": "assistant", "content": [{"type": "text", "text": vlm_action}]}
         ]
         return messages, imgs_for_this_sample
-
-    def _process_math_vl_data(self, batch: Dict, i: int, imgs_for_this_sample: List):
+    def _process_math_vl_data(self, batch: lerobot.processor.EnvTransition, i: int, imgs_for_this_sample: List):
         head_img = batch['observation.images.head'][i]
         if head_img is not None:
-            # Revert the unsqueeze(0) added during collation
+            # Revert unsqueeze(0) if present depending on how pure collate works
             frame = head_img[0] if head_img.dim() == 4 else head_img
             imgs_for_this_sample.append(frame)
 
@@ -254,8 +198,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             {"role": "assistant", "content": [{"type": "text", "text": text_answer}]}
         ]
         return messages, imgs_for_this_sample
-
-    def __call__(self, batch: Any) -> lerobot.processor.EnvTransition:
+    def __call__(self, batch: lerobot.processor.EnvTransition) -> lerobot.processor.EnvTransition:
         """Processes a single batched EnvTransition."""
         batch_size = len(batch['task'])
         text_prompts = []
@@ -414,7 +357,6 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 
     return model, transformer_processor
 
-
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
@@ -446,25 +388,23 @@ def train(config: TrainingConfig):
         # Merge robot datasets
         robot_dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
         
-        # Load new Math VL dataset
+        # Load new Math VL dataset (now correctly defaults to full dataset)
         math_vl_dataset = load_datasets.load_math_reasoning_datasets(
             samples_per_dataset=config.math_vl_samples_per_dataset
         )
         
         policy_preprocessor = make_policy_processor(config, transformer_processor)
-
-    # Clean composition: separate collation logic from text processing logic
     def composed_collate_fn(instances: List[Dict]):
-        # 1. Collate standard instances into a batched EnvTransition format
+        # The imported original pure collator only batches
         batched_transition = collate_with_observation_image_lists(instances)
-        # 2. Let the processor handle tokenization and tensor extraction
+        # Process handles EnvTransition
         return policy_preprocessor(batched_transition)
 
     train_dataloader = build_co_training_dataloader(
         robot_dataset=robot_dataset,
         math_hf_dataset=math_vl_dataset,
         batch_size=config.per_device_batch_size,
-        policy_processor=composed_collate_fn, # Pass the composed pipeline
+        policy_processor=composed_collate_fn, 
         robot_ratio=(1.0 - config.math_vl_mixing_ratio), 
         num_workers=config.dataloader_num_workers
     )

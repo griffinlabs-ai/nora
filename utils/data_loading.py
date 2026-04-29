@@ -121,13 +121,6 @@ def load_lerobot_dataset_skip_dirty_episodes(
     *args,
     **kwargs,
 ) -> PreprocessedDataset:
-    """
-    Loads preprocessed dataset. The following preprocessing steps are applied:
-    - Transform the instance from the raw dataset to the desired format (by the `instance_transform` param).
-    - Convert action tensor from absolute space to delta space.
-    - Resample the action tensor from one chunk size to another if necessary.
-    - Normalize the action tensor.
-    """
     if episodes is None and root is not None:
         removed_episodes_path = pathlib.Path(root) / 'meta/removed_episodes.json'
         if removed_episodes_path.exists():
@@ -147,6 +140,13 @@ def load_dataset(
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
     num_frames: int = 1, 
 ) -> PreprocessedDataset:
+    """
+    Loads preprocessed dataset. The following preprocessing steps are applied:
+    - Transform the instance from the raw dataset to the desired format (by the `instance_transform` param).
+    - Convert action tensor from absolute space to delta space.
+    - Resample the action tensor from one chunk size to another if necessary.
+    - Normalize the action tensor.
+    """
     root = pathlib.Path(root)
 
     action_delta_timestamps = [i / raw_fps for i in range(load_action_chunk_size)]
@@ -211,10 +211,6 @@ def load_dataset(
     dataset = PreprocessedDataset(dataset, preprocessor)
     return dataset
 
-
-# =================================================================================
-# [MODIFIED] Data Loading & Collation architecture based on "in one go" feedback
-# =================================================================================
 
 def build_co_training_dataloader(
     robot_dataset: Dataset, 

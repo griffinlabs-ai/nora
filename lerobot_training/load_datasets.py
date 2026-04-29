@@ -1,6 +1,6 @@
 import functools
 import pathlib
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 import torch
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
@@ -346,7 +346,10 @@ def load_interndata_a1_dataset(
 # ==========================================
 
 def _standardize_math_format(example, img_col, inst_col, ans_col):
-    """Formats raw HuggingFace dataset items into the unified schema."""
+    """
+    Formats raw HuggingFace dataset items directly into an EnvTransition-compatible schema.
+    This aligns the keys with robot dataset output, so a pure collate_fn can batch them together.
+    """
     img_data = example.get(img_col)
     image = None
     
@@ -357,44 +360,48 @@ def _standardize_math_format(example, img_col, inst_col, ans_col):
             
             if hasattr(img_data, "convert"):
                 image = img_data.convert('RGB')
-    # Replaced bare Exception with specific exceptions to prevent masking other bugs
     except (OSError, ValueError, TypeError, PIL.UnidentifiedImageError):
         image = None
 
+    # Use filler tensors for fields that Math data lacks but Robot data requires.
     return {
-        "image": image,
-        "instruction": str(example.get(inst_col, "")),
-        "text_answer": str(example.get(ans_col, "")),
-        "task_type": "vl_math"
+        "observation.images.head": image,
+        "observation.images.hand_left": None,
+        "observation.images.hand_right": None,
+        "action": torch.zeros((1, 14)),  # Dummy filler action to maintain uniform shape
+        "action_dim_is_pad": torch.zeros(14, dtype=torch.bool), # Dummy pad flag
+        "task": str(example.get(inst_col, "")),
+        "info": {"task_type": "vl_math", "embodiment_prompt": "None"},
+        "complementary_data": {"text_answer": str(example.get(ans_col, ""))}
     }
 
-def _load_single_math_dataset(repo_id: str, split: str, img_col: str, inst_col: str, ans_col: str, num_samples: int):
+def _load_single_math_dataset(repo_id: str, split: str, img_col: str, inst_col: str, ans_col: str, num_samples: Optional[int]):
     """
-    Loads a single dataset and selects the specified number of samples.
-    Applies the DRY principle and removes soft-failures. It will fail loudly if the dataset is missing.
+    Loads a single dataset and applies EnvTransition formatting.
+    If num_samples is provided, truncates the dataset; otherwise uses the full split.
     """
     ds = hf_load_dataset(repo_id, split=split)
     
     ds = ds.map(
         lambda x: _standardize_math_format(x, img_col, inst_col, ans_col),
         remove_columns=ds.column_names
-    ).filter(lambda x: x["image"] is not None)
+    ).filter(lambda x: x["observation.images.head"] is not None)
     
-    actual_samples = min(num_samples, len(ds))
-    ds = ds.select(range(actual_samples))
+    if num_samples is not None:
+        actual_samples = min(num_samples, len(ds))
+        ds = ds.select(range(actual_samples))
     
     if len(ds) > 0:
-        ds = ds.cast_column("image", HFImage())
+        # Note: the key is now the EnvTransition key, not just "image"
+        ds = ds.cast_column("observation.images.head", HFImage())
         
     return ds
 
-def load_math_reasoning_datasets(samples_per_dataset: int = 50000):
+def load_math_reasoning_datasets(samples_per_dataset: Optional[int] = None):
     """
     Loads and standardizes mathematical reasoning datasets from Hugging Face.
-    Converts various dataset formats into a unified schema:
-    {'image': PIL.Image, 'instruction': str, 'text_answer': str, 'task_type': 'vl_math'}
+    Converts various dataset formats into a unified EnvTransition schema.
     """
-    # Dataset configurations for DRY looping
     datasets_config = [
         ("MathLLMs/MathVision", "test", "image", "question", "answer"),
         ("AI4Math/MathVista", "testmini", "decoded_image", "query", "answer"),
@@ -405,7 +412,6 @@ def load_math_reasoning_datasets(samples_per_dataset: int = 50000):
     standardized_datasets = []
     
     for repo_id, split, img_col, inst_col, ans_col in datasets_config:
-        # Fails fast if any dataset is unavailable (no try-except wrappers)
         ds = _load_single_math_dataset(
             repo_id=repo_id,
             split=split,
@@ -417,5 +423,4 @@ def load_math_reasoning_datasets(samples_per_dataset: int = 50000):
         standardized_datasets.append(ds)
 
     mixed_math_dataset = concatenate_datasets(standardized_datasets)
-    mixed_math_dataset = mixed_math_dataset.shuffle(seed=42)
     return mixed_math_dataset
