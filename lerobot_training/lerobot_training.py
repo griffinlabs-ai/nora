@@ -46,7 +46,7 @@ class TrainingConfig:
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
     agibot_world_root: str = "data/agibot-world/tasks"
-    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset/subsets"
+    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
     wandb_project_name: str = "Nora VLA with LeRobotDataset"
     checkpoint_save_frequency: int = 20000
@@ -171,17 +171,21 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             vlm_action = map_fast_token_to_vlm_action(fast_tokens)
             
             task = transition['complementary_data']['task'][i]
+            subtask = transition['complementary_data']['subtask'][i]
             embodiment = transition['info']['embodiment_prompt'][i]
 
             # 3. Construct the message with image placeholders ONLY
-            content = [{"type": "text", "text": f"[embodiment: {embodiment}]\n"}]
+            content = [{"type": "text", "text": f"[embodiment: {embodiment}] "}]
             for _ in imgs_for_this_sample:
                 content.append({"type": "image"})
-            content.append({"type": "text", "text": task})
+            content.append({"type": "text", "text": f"{task}\npredict subtask: {'true' if subtask else 'false'}"})
 
+            subtask_segment = f"subtask: {subtask}\n" if subtask else ""
             messages = [
                 {"role": "user", "content": content},
-                {"role": "assistant", "content": [{"type": "text", "text": vlm_action}]}
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": f"{subtask_segment}action: {vlm_action}"},
+                ]}
             ]
             
             # Get purely textual prompt with <image> placeholders
@@ -200,14 +204,14 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         
         labels = batch_input['input_ids'].clone()
 
-        # Mask out everything before the action tokens to calculate loss only on actions
+        # Mask out everything before the final start-of-turn token to calculate loss only on model output
+        sot_token_id = self.transformer_processor.tokenizer.sot_token_id
         for i in range(labels.size(0)):
             seq = labels[i]
-            mask_seq = (seq >= self.action_token_min) & (seq <= self.action_token_max)
-            nonzero_indices = torch.nonzero(mask_seq, as_tuple=False)
-            if nonzero_indices.numel() > 0:
-                first_action_index = nonzero_indices[0].item()
-                seq[:first_action_index] = -100
+            sot_indices = (seq == sot_token_id).nonzero(as_tuple=False)
+            if sot_indices.numel() > 0:
+                last_sot_index = sot_indices[-1].item()
+                seq[:last_sot_index] = -100
             else:
                 seq[:] = -100
 
