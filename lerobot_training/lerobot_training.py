@@ -1,3 +1,4 @@
+from datetime import timedelta
 from functools import lru_cache
 import sys
 import pathlib
@@ -18,7 +19,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchvision.transforms as T_v2
 
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.logging import get_logger
 
 # Use dynamic import to support different transformers versions for VLM base classes
@@ -312,7 +313,12 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
-    accelerator = Accelerator(gradient_accumulation_steps=config.gradient_accumulation_steps, log_with="wandb")
+    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=1800))
+    accelerator = Accelerator(
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        log_with="wandb",
+        kwargs_handlers=[kwargs],
+    )
     accelerator.dataloader_config.dispatch_batches = False
     logger.info(accelerator.state, main_process_only=False)
 
