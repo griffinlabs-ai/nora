@@ -132,7 +132,7 @@ def load_lerobot_dataset_skip_dirty_episodes(
     if episodes is None and root is not None:
         removed_episodes_path = pathlib.Path(root) / 'meta/removed_episodes.json'
         if removed_episodes_path.exists():
-            total_episodes = lerobot.datasets.utils.load_info(root)['total_episodes']
+            total_episodes = lerobot.datasets.io_utils.load_info(root)['total_episodes']
             with open(removed_episodes_path, 'r') as f:
                 removed_episodes = json.load(f)['dirty_episodes']
             episodes = [i for i in range(total_episodes) if i not in removed_episodes]
