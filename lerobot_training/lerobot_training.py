@@ -37,36 +37,29 @@ logger = get_logger(__name__)
 # --- 1. Configuration ---
 @dataclass
 class TrainingConfig:
-    per_device_batch_size: int = 256
+    per_device_batch_size: int = 64
     learning_rate: float = 5e-5
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 4
     num_warmup_steps: int = 1000
     max_epochs: int = 5
-    output_dir: str = './nora_finetune_object'
+    output_dir: str = './griffin_alpha_finetune_object'
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
     agibot_world_root: str = "data/agibot-world/tasks"
     galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
-    wandb_project_name: str = "Nora VLA with LeRobotDataset"
+    wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 4
     action_chunk_size: int = 50
-    
-    # Updated to use Gemma-4 E4B
-    model_id: str = "google/gemma-4-E4B-it" 
+    model_id: str = "google/gemma-4-E4B-it"
     action_vocab_size: int = 2048
-
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
-    
-    # Number of frames to input (5 past + 1 current = 6)
+    # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 6
-    
-    # [Resolved from refactor branch] Flag for image augmentation
-    image_augmentation: bool = False
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -240,12 +233,13 @@ def make_policy_processor(config: TrainingConfig, transformer_processor: Any) ->
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     """Loads Gemma-4, its processor, injects action tokens, and applies embedding hotfix."""
-    transformer_processor = AutoProcessor.from_pretrained(
-        config.model_id,
-        trust_remote_code=True,
-        max_soft_tokens=config.max_tokens_per_image,
-        image_seq_length=config.max_tokens_per_image,
-    )
+    with accelerator.main_process_first():
+        transformer_processor = AutoProcessor.from_pretrained(
+            config.model_id,
+            trust_remote_code=True,
+            max_soft_tokens=config.max_tokens_per_image,
+            image_seq_length=config.max_tokens_per_image,
+        )
     
     # Ensure pad token exists
     if transformer_processor.tokenizer.pad_token is None:
@@ -262,16 +256,22 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     accelerator.print(f"Added {len(action_tokens)} action tokens to Gemma-4 vocabulary.")
     accelerator.print(f"Vocab size resized: {old_vocab_size} -> {new_vocab_size}")
 
-    model = AutoModelClass.from_pretrained(
-        config.model_id,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
-    )
+    with accelerator.main_process_first():
+        model = AutoModelClass.from_pretrained(
+            config.model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True
+        )
 
-    # Standard API resizing
+    # Resize token embedding layers
+    accelerator.print("Resizing token embedding layer.")
+    # Make sure other processes will be busy too,
+    # so they won't be waiting for the main process and end up timing out
+    accelerator.wait_for_everyone()
     model.resize_token_embeddings(new_vocab_size)
     if hasattr(model, 'config'):
         model.config.vocab_size = new_vocab_size
+    accelerator.print("Done resizing token embedding layer.")
 
     # =====================================================================
     # [HOTFIX] Scan and force resize nested embedding layers missed by API
@@ -320,23 +320,24 @@ def train(config: TrainingConfig):
 
     model, transformer_processor = load_model_and_processor(config, accelerator)
 
+    agibot_world = load_datasets.load_agibot_world_dataset(
+        root = config.agibot_world_root,
+        canonical_action_chunk_size = config.action_chunk_size,
+        num_frames = config.num_frames, 
+    )
+    galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
+        root = config.galaxea_open_world_ds_root,
+        canonical_action_chunk_size = config.action_chunk_size,
+        num_frames = config.num_frames, 
+    )
+    interndata_a1 = load_datasets.load_interndata_a1_dataset(
+        root = config.interndata_a1_root,
+        canonical_action_chunk_size = config.action_chunk_size,
+        num_frames = config.num_frames, 
+    )
+    dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
+
     with accelerator.main_process_first():
-        agibot_world = load_datasets.load_agibot_world_dataset(
-            root = config.agibot_world_root,
-            canonical_action_chunk_size = config.action_chunk_size,
-            num_frames = config.num_frames, 
-        )
-        galaxea_open_world_ds = load_datasets.load_galaxea_dataset(
-            root = config.galaxea_open_world_ds_root,
-            canonical_action_chunk_size = config.action_chunk_size,
-            num_frames = config.num_frames, 
-        )
-        interndata_a1 = load_datasets.load_interndata_a1_dataset(
-            root = config.interndata_a1_root,
-            canonical_action_chunk_size = config.action_chunk_size,
-            num_frames = config.num_frames, 
-        )
-        dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
         policy_preprocessor = make_policy_processor(config, transformer_processor)
 
     train_dataloader = DataLoader(
