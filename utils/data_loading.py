@@ -231,25 +231,27 @@ def load_dataset(
     ]
 
     preprocessed_subsets: list[PreprocessedDataset] = []
-    for task_root in tqdm(task_roots, desc=f"Loading ds — {root}"):
-        lerobot_ds = load_lerobot_dataset_skip_dirty_episodes(
-            str(task_root.relative_to(root)),
-            root=task_root,
-            delta_timestamps=delta_timestamps,
-        )
-        task_config = load_task_config(task_root)
-        subset_inst_transform = functools.partial(
-            instance_transform,
-            meta=lerobot_ds.meta,
-            task_config=task_config,
-        )
-        preprocessor = PolicyProcessorPipeline(
-            steps=processor_steps,
-            to_transition=lambda b: lerobot.processor.converters.batch_to_transition(
-                subset_inst_transform(b)
-            ),
-        )
-        preprocessed_subsets.append(PreprocessedDataset(lerobot_ds, preprocessor))
+    with tqdm(task_roots, desc=f"Loading ds — {root}") as tqdm_task_roots:
+        for task_root in tqdm_task_roots:
+            tqdm_task_roots.set_description(f"Loading ds — {root}/{task_root.relative_to(root)}")
+            lerobot_ds = load_lerobot_dataset_skip_dirty_episodes(
+                str(task_root.relative_to(root)),
+                root=task_root,
+                delta_timestamps=delta_timestamps,
+            )
+            task_config = load_task_config(task_root)
+            subset_inst_transform = functools.partial(
+                instance_transform,
+                meta=lerobot_ds.meta,
+                task_config=task_config,
+            )
+            preprocessor = PolicyProcessorPipeline(
+                steps=processor_steps,
+                to_transition=lambda b, inst_transform=subset_inst_transform: 
+                    lerobot.processor.converters.batch_to_transition(inst_transform(b))
+            )
+            preprocessed_subsets.append(PreprocessedDataset(lerobot_ds, preprocessor))
+        tqdm_task_roots.set_description(f"Done loading ds — {root}")
 
     return ConcatDataset(preprocessed_subsets)
 
