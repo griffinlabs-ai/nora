@@ -1,6 +1,7 @@
 from datetime import timedelta
 from functools import lru_cache
 import sys
+import resource
 import pathlib
 
 from torch.utils.data.dataset import ConcatDataset
@@ -19,7 +20,7 @@ import torch
 from torch.utils.data import DataLoader
 import torchvision.transforms as T_v2
 
-from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
 from accelerate.logging import get_logger
 
 # Use dynamic import to support different transformers versions for VLM base classes
@@ -38,11 +39,11 @@ logger = get_logger(__name__)
 # --- 1. Configuration ---
 @dataclass
 class TrainingConfig:
-    per_device_batch_size: int = 64
+    per_device_batch_size: int = 2
     learning_rate: float = 5e-5
-    gradient_accumulation_steps: int = 4
-    num_warmup_steps: int = 1000
-    max_epochs: int = 5
+    gradient_accumulation_steps: int = 128
+    num_warmup_steps: int = 128000
+    max_epochs: int = 1
     output_dir: str = './griffin_alpha_finetune_object'
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
@@ -50,8 +51,8 @@ class TrainingConfig:
     galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
     wandb_project_name: str = "Griffin Alpha"
-    checkpoint_save_frequency: int = 20000
-    logging_frequency: int = 100
+    checkpoint_save_frequency: int = 640000
+    logging_frequency: int = 1
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 4
     action_chunk_size: int = 50
@@ -60,7 +61,7 @@ class TrainingConfig:
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
     # Number of image frames to input (5 past + 1 current = 6)
-    num_frames: int = 6
+    num_frames: int = 3
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -313,11 +314,17 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
-    kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=1800))
+    # increase the number of open files limit to accommodate large datasets
+    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, hard))
+
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         log_with="wandb",
-        kwargs_handlers=[kwargs],
+        kwargs_handlers=[
+            InitProcessGroupKwargs(timeout=timedelta(seconds=1800)),
+            DistributedDataParallelKwargs(find_unused_parameters=True),
+        ],
     )
     accelerator.dataloader_config.dispatch_batches = False
     logger.info(accelerator.state, main_process_only=False)
@@ -342,6 +349,7 @@ def train(config: TrainingConfig):
         num_frames = config.num_frames, 
     )
     dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1])
+    accelerator.print(f"Total number of examples in dataset: {len(dataset)}")
 
     with accelerator.main_process_first():
         policy_preprocessor = make_policy_processor(config, transformer_processor)
