@@ -39,10 +39,10 @@ logger = get_logger(__name__)
 # --- 1. Configuration ---
 @dataclass
 class TrainingConfig:
-    per_device_batch_size: int = 2
+    per_device_batch_size: int = 4
     learning_rate: float = 5e-5
-    gradient_accumulation_steps: int = 128
-    num_warmup_steps: int = 128000
+    gradient_accumulation_steps: int = 64
+    num_warmup_steps: int = 64000
     max_epochs: int = 1
     output_dir: str = './griffin_alpha_finetune_object'
     resume_from_checkpoint: str = ''
@@ -51,17 +51,17 @@ class TrainingConfig:
     galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
     wandb_project_name: str = "Griffin Alpha"
-    checkpoint_save_frequency: int = 640000
+    checkpoint_save_frequency: int = 320000
     logging_frequency: int = 1
     gradient_clipping: Optional[float] = None
-    dataloader_num_workers: int = 4
+    dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
     action_vocab_size: int = 2048
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
     # Number of image frames to input (5 past + 1 current = 6)
-    num_frames: int = 3
+    num_frames: int = 1
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -264,6 +264,8 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
             torch_dtype=torch.bfloat16,
             trust_remote_code=True
         )
+    # model.gradient_checkpointing_enable()
+    # model.config.use_cache = False
 
     # Resize token embedding layers
     accelerator.print("Resizing token embedding layer.")

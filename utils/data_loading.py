@@ -232,7 +232,7 @@ def load_dataset(
 
     # 2. Image timestamps (Past observation history)
     # We dynamically find the image keys from the first dataset to apply history frames
-    if task_roots and num_frames > 1:
+    if task_roots:# and num_frames > 1:
         
         repo_id = str(task_roots[0].relative_to(root))
         meta = LeRobotDatasetMetadata(repo_id, root=task_roots[0])
