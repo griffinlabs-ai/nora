@@ -112,6 +112,13 @@ add_uv_install_dirs_to_path() {
   done
 }
 
+add_project_venv_to_path() {
+  local venv_bin="${REPO_ROOT}/.venv/bin"
+  if [[ -d "${venv_bin}" && ":${PATH}:" != *":${venv_bin}:"* ]]; then
+    export PATH="${venv_bin}:${PATH}"
+  fi
+}
+
 install_uv() {
   if command -v uv >/dev/null 2>&1; then
     return 0
@@ -198,14 +205,6 @@ fi
 
 install_system_deps
 
-if [[ -n "${HF_TOKEN}" ]]; then
-  if ! command -v hf >/dev/null 2>&1; then
-    echo "hf CLI is required for Hugging Face login/downloads but not found." >&2
-    exit 1
-  fi
-  hf auth login --token "${HF_TOKEN}"
-fi
-
 echo "Installing Python ${PYTHON_VERSION} with uv..."
 uv python install "${PYTHON_VERSION}"
 
@@ -215,6 +214,20 @@ if [[ -n "${UV_SYNC_ARGS}" ]]; then
   uv sync --python "${PYTHON_VERSION}" ${UV_SYNC_ARGS}
 else
   uv sync --python "${PYTHON_VERSION}"
+fi
+
+add_project_venv_to_path
+
+if [[ "${DOWNLOAD_PROFILE}" != "none" || -n "${HF_TOKEN}" ]]; then
+  if ! command -v hf >/dev/null 2>&1; then
+    echo "hf CLI is required for Hugging Face login/downloads but not found after uv sync." >&2
+    echo "Ensure huggingface-hub is installed in the project environment." >&2
+    exit 1
+  fi
+fi
+
+if [[ -n "${HF_TOKEN}" ]]; then
+  hf auth login --token "${HF_TOKEN}"
 fi
 
 case "${DOWNLOAD_PROFILE}" in
