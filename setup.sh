@@ -32,13 +32,25 @@ while [[ $# -gt 0 ]]; do
       PYTHON_VERSION="${2:-}"
       shift 2
       ;;
+    --python-version=*)
+      PYTHON_VERSION="${1#*=}"
+      shift
+      ;;
     --hf-token)
       HF_TOKEN="${2:-}"
       shift 2
       ;;
+    --hf-token=*)
+      HF_TOKEN="${1#*=}"
+      shift
+      ;;
     --download-profile)
       DOWNLOAD_PROFILE="${2:-}"
       shift 2
+      ;;
+    --download-profile=*)
+      DOWNLOAD_PROFILE="${1#*=}"
+      shift
       ;;
     --skip-system-deps)
       SKIP_SYSTEM_DEPS=true
@@ -47,6 +59,10 @@ while [[ $# -gt 0 ]]; do
     --uv-sync-args)
       UV_SYNC_ARGS="${2:-}"
       shift 2
+      ;;
+    --uv-sync-args=*)
+      UV_SYNC_ARGS="${1#*=}"
+      shift
       ;;
     -h|--help)
       usage
