@@ -84,6 +84,9 @@ case "${DOWNLOAD_PROFILE}" in
     ;;
 esac
 
+SETUP_HF_TOKEN="${HF_TOKEN}"
+unset HF_TOKEN
+
 cd "${REPO_ROOT}"
 
 run_privileged() {
@@ -156,15 +159,16 @@ else
   echo "Skipping system dependency installation (no supported package manager detected)." >&2
 fi
 
-if [[ "${DOWNLOAD_PROFILE}" != "none" || -n "${HF_TOKEN}" ]]; then
+if [[ "${DOWNLOAD_PROFILE}" != "none" || -n "${SETUP_HF_TOKEN}" ]]; then
   if ! command -v hf >/dev/null 2>&1; then
     echo "hf CLI is required for Hugging Face login/downloads but not found after pip install." >&2
     exit 1
   fi
 fi
 
-if [[ -n "${HF_TOKEN}" ]]; then
-  hf auth login --token "${HF_TOKEN}"
+if [[ -n "${SETUP_HF_TOKEN}" ]]; then
+  env -u HF_TOKEN hf auth login --token "${SETUP_HF_TOKEN}"
+  export HF_TOKEN="${SETUP_HF_TOKEN}"
 fi
 
 case "${DOWNLOAD_PROFILE}" in
