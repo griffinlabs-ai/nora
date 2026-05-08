@@ -85,14 +85,21 @@ python run_widowx.py
 
 
 ## How to Pretrain Nora/ Finetune nora in Lerobot dataset
-As of now, we are using a different version of torch when finetuning with Lerobot dataset due to Lerobot expects torchvision>=0.21.0.
+The LeRobot training environment is managed with [`uv`](https://docs.astral.sh/uv/). Dependencies live in the root `pyproject.toml` (and are pinned in `uv.lock`). LeRobot 0.5.x requires Python ≥ 3.12.
+
 ```bash
 git clone https://github.com/declare-lab/nora.git
-cd lerobot_training
-# Create and activate conda environment
-conda create -n nora_lerobot python=3.10 -y
-conda activate nora_lerobot
-pip install -r lerobot_requirements.txt
+cd nora
+# Install uv if you don't have it: https://docs.astral.sh/uv/getting-started/installation/
+uv sync
+# Activate the virtualenv (or use `uv run` to invoke commands inside it)
+source .venv/bin/activate
+```
+
+To run the LeRobot training script:
+
+```bash
+uv run python lerobot_training/lerobot_training.py
 ```
 Model hyperparameters/settings are stored in the TrainingConfig in lerobot_training.py. You can specify the path to the corresponding Lerobot dataset you wish to finetune Nora on. Do note that Nora is pretrained on 7 DoF action space (6+1 grippler action), finetuning on other action space may not work well.
 

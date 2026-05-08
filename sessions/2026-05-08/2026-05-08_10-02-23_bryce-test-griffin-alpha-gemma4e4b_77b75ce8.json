@@ -1,0 +1,39 @@
+{
+  "session_id": "77b75ce8",
+  "experiment_name": "bryce-test-griffin-alpha-gemma4e4b",
+  "run_label": "bryce-test-griffin-alpha-gemma4e4b-77b75ce8",
+  "author": "brycegoh",
+  "timestamp": "2026-05-08T10:02:23Z",
+  "status": "running",
+  "pod_id": "tr54n6yh2sqj7b",
+  "tmux_session": "bryce-test-griffin-alpha-gemma4e4b-77b75ce8",
+  "session_file": "2026-05-08/2026-05-08_10-02-23_bryce-test-griffin-alpha-gemma4e4b_77b75ce8.json",
+  "config": {
+    "experiment_name": "bryce-test-griffin-alpha-gemma4e4b",
+    "github_repo_url": "https://github.com/griffinlabs-ai/nora.git",
+    "github_branch": "main",
+    "model_type": null,
+    "setup_args": {
+      "--python-version": "3.12",
+      "--download-profile": "none",
+      "--hf-token": ""
+    },
+    "train_args": {
+      "--output-dir": "/workspace/checkpoints/griffin_alpha_finetune_object",
+      "--wandb-project-name": "Bryce Test Griffin Alpha"
+    },
+    "pod": {
+      "gpu_type": "NVIDIA RTX A5000",
+      "gpu_count": 1,
+      "container_disk_gb": 80,
+      "volume_gb": 500,
+      "template_id": "8u8g3zo2jg"
+    },
+    "stop_after_training": true,
+    "session_id": "77b75ce8",
+    "author": "brycegoh",
+    "timestamp": "2026-05-08T10:02:23Z"
+  },
+  "started_at": "2026-05-08T10:02:26Z",
+  "ended_at": null
+}

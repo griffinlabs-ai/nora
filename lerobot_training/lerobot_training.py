@@ -1,4 +1,6 @@
 from datetime import timedelta
+import argparse
+import json
 from functools import lru_cache
 import sys
 import resource
@@ -449,7 +451,23 @@ def train(config: TrainingConfig):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train NORA with LeRobot datasets.")
+    parser.add_argument(
+        "--config-json",
+        type=str,
+        default="",
+        help="JSON object with TrainingConfig field overrides.",
+    )
+    args = parser.parse_args()
+
     config = TrainingConfig()
+    if args.config_json:
+        overrides = json.loads(args.config_json)
+        for key, value in overrides.items():
+            if not hasattr(config, key):
+                raise ValueError(f"Unknown TrainingConfig field: {key}")
+            setattr(config, key, value)
+
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
