@@ -126,6 +126,10 @@ else
   uv sync --python "${PYTHON_VERSION}"
 fi
 
+echo "Installing Hugging Face Hub CLI with pip..."
+"${REPO_ROOT}/.venv/bin/python" -m ensurepip --upgrade
+"${REPO_ROOT}/.venv/bin/python" -m pip install --upgrade "huggingface_hub[cli]"
+
 if [[ "${SKIP_SYSTEM_DEPS}" == "true" ]]; then
   echo "Skipping system dependency installation."
 elif command -v apt-get >/dev/null 2>&1; then
@@ -154,8 +158,7 @@ fi
 
 if [[ "${DOWNLOAD_PROFILE}" != "none" || -n "${HF_TOKEN}" ]]; then
   if ! command -v hf >/dev/null 2>&1; then
-    echo "hf CLI is required for Hugging Face login/downloads but not found after uv sync." >&2
-    echo "Ensure huggingface-hub is installed in the project environment." >&2
+    echo "hf CLI is required for Hugging Face login/downloads but not found after pip install." >&2
     exit 1
   fi
 fi
