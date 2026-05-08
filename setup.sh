@@ -97,113 +97,23 @@ run_privileged() {
   fi
 }
 
-add_uv_install_dirs_to_path() {
-  local candidate_dirs=()
-  if [[ -n "${HOME:-}" ]]; then
-    candidate_dirs+=("${HOME}/.local/bin" "${HOME}/.cargo/bin" "${HOME}/.pyenv/shims")
-  fi
-  candidate_dirs+=("/usr/local/bin" "/opt/homebrew/bin")
+export PATH="${HOME:-}/.local/bin:${REPO_ROOT}/.venv/bin:${PATH}"
 
-  local dir
-  for dir in "${candidate_dirs[@]}"; do
-    if [[ -d "${dir}" && ":${PATH}:" != *":${dir}:"* ]]; then
-      export PATH="${dir}:${PATH}"
-    fi
-  done
-}
-
-add_project_venv_to_path() {
-  local venv_bin="${REPO_ROOT}/.venv/bin"
-  if [[ -d "${venv_bin}" && ":${PATH}:" != *":${venv_bin}:"* ]]; then
-    export PATH="${venv_bin}:${PATH}"
-  fi
-}
-
-install_uv() {
-  if command -v uv >/dev/null 2>&1; then
-    return 0
-  fi
-
+if ! command -v uv >/dev/null 2>&1; then
   echo "Installing uv..."
-  if command -v brew >/dev/null 2>&1; then
-    brew install uv
-  elif command -v curl >/dev/null 2>&1; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="${HOME}/.local/bin:${PATH}"
-  else
-    echo "Unable to install uv automatically (missing brew/curl)." >&2
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Unable to install uv automatically (missing curl)." >&2
     echo "Install uv manually: https://docs.astral.sh/uv/getting-started/installation/" >&2
     exit 1
   fi
-
-  if ! command -v uv >/dev/null 2>&1; then
-    add_uv_install_dirs_to_path
-  fi
-
-  if ! command -v uv >/dev/null 2>&1; then
-    echo "uv installation completed but uv is still not on PATH." >&2
-    echo "Try restarting the shell or adding ~/.local/bin to PATH." >&2
-    exit 1
-  fi
-}
-
-install_system_deps() {
-  if [[ "${SKIP_SYSTEM_DEPS}" == "true" ]]; then
-    echo "Skipping system dependency installation."
-    return 0
-  fi
-
-  if command -v apt-get >/dev/null 2>&1; then
-    local apt_pkgs=(
-      ffmpeg
-      tmux
-      cmake
-      build-essential
-      python3-dev
-      pkg-config
-      libavcodec-dev
-      libavdevice-dev
-      libavfilter-dev
-      libavformat-dev
-      libavutil-dev
-      libswresample-dev
-      libswscale-dev
-    )
-
-    local missing_pkgs=()
-    local pkg
-    for pkg in "${apt_pkgs[@]}"; do
-      if ! dpkg -s "${pkg}" >/dev/null 2>&1; then
-        missing_pkgs+=("${pkg}")
-      fi
-    done
-
-    if (( ${#missing_pkgs[@]} > 0 )); then
-      echo "Installing apt packages: ${missing_pkgs[*]}"
-      run_privileged apt-get update
-      run_privileged apt-get install -y "${missing_pkgs[@]}"
-    else
-      echo "System dependencies already installed."
-    fi
-  elif command -v brew >/dev/null 2>&1; then
-    if ! command -v ffmpeg >/dev/null 2>&1; then
-      echo "Installing ffmpeg via Homebrew..."
-      brew install ffmpeg
-    else
-      echo "ffmpeg already installed."
-    fi
-  else
-    echo "Skipping system dependency installation (no supported package manager detected)." >&2
-  fi
-}
-
-add_uv_install_dirs_to_path
-
-if ! command -v uv >/dev/null 2>&1; then
-  install_uv
+  curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 
-install_system_deps
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv installation completed but uv is still not on PATH." >&2
+  echo "Try restarting the shell or adding ~/.local/bin to PATH." >&2
+  exit 1
+fi
 
 echo "Installing Python ${PYTHON_VERSION} with uv..."
 uv python install "${PYTHON_VERSION}"
@@ -216,7 +126,31 @@ else
   uv sync --python "${PYTHON_VERSION}"
 fi
 
-add_project_venv_to_path
+if [[ "${SKIP_SYSTEM_DEPS}" == "true" ]]; then
+  echo "Skipping system dependency installation."
+elif command -v apt-get >/dev/null 2>&1; then
+  echo "Installing apt packages..."
+  run_privileged apt-get update
+  run_privileged apt-get install -y \
+    ffmpeg \
+    tmux \
+    cmake \
+    build-essential \
+    python3-dev \
+    pkg-config \
+    libavcodec-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswresample-dev \
+    libswscale-dev
+elif command -v brew >/dev/null 2>&1; then
+  echo "Installing Homebrew packages..."
+  brew install ffmpeg
+else
+  echo "Skipping system dependency installation (no supported package manager detected)." >&2
+fi
 
 if [[ "${DOWNLOAD_PROFILE}" != "none" || -n "${HF_TOKEN}" ]]; then
   if ! command -v hf >/dev/null 2>&1; then
