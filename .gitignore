@@ -150,3 +150,5 @@ notebook/templates/*.html
 .venv/
 
 .env
+
+sessions/
