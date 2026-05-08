@@ -71,6 +71,21 @@ WANDB_PROJECT_NAME="Griffin Alpha"
 GRADIENT_CLIPPING=""
 DRY_RUN=false
 
+add_uv_install_dirs_to_path() {
+  local candidate_dirs=()
+  if [[ -n "${HOME:-}" ]]; then
+    candidate_dirs+=("${HOME}/.local/bin" "${HOME}/.cargo/bin" "${HOME}/.pyenv/shims")
+  fi
+  candidate_dirs+=("/usr/local/bin" "/opt/homebrew/bin")
+
+  local dir
+  for dir in "${candidate_dirs[@]}"; do
+    if [[ -d "${dir}" && ":${PATH}:" != *":${dir}:"* ]]; then
+      export PATH="${dir}:${PATH}"
+    fi
+  done
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --num-processes) NUM_PROCESSES="${2:-}"; shift 2 ;;
@@ -131,8 +146,11 @@ done
 
 cd "${REPO_ROOT}"
 
+add_uv_install_dirs_to_path
+
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is required but not found." >&2
+  echo "Run ./setup.sh first, or add the uv install directory to PATH." >&2
   exit 1
 fi
 

@@ -97,6 +97,21 @@ run_privileged() {
   fi
 }
 
+add_uv_install_dirs_to_path() {
+  local candidate_dirs=()
+  if [[ -n "${HOME:-}" ]]; then
+    candidate_dirs+=("${HOME}/.local/bin" "${HOME}/.cargo/bin" "${HOME}/.pyenv/shims")
+  fi
+  candidate_dirs+=("/usr/local/bin" "/opt/homebrew/bin")
+
+  local dir
+  for dir in "${candidate_dirs[@]}"; do
+    if [[ -d "${dir}" && ":${PATH}:" != *":${dir}:"* ]]; then
+      export PATH="${dir}:${PATH}"
+    fi
+  done
+}
+
 install_uv() {
   if command -v uv >/dev/null 2>&1; then
     return 0
@@ -115,9 +130,7 @@ install_uv() {
   fi
 
   if ! command -v uv >/dev/null 2>&1; then
-    if [[ -x "${HOME}/.local/bin/uv" ]]; then
-      export PATH="${HOME}/.local/bin:${PATH}"
-    fi
+    add_uv_install_dirs_to_path
   fi
 
   if ! command -v uv >/dev/null 2>&1; then
@@ -176,6 +189,8 @@ install_system_deps() {
     echo "Skipping system dependency installation (no supported package manager detected)." >&2
   fi
 }
+
+add_uv_install_dirs_to_path
 
 if ! command -v uv >/dev/null 2>&1; then
   install_uv
