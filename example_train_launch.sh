@@ -16,5 +16,7 @@ uv run --env-file .env model-trainer \
   --container_disk_gb=80 \
   --volume_gb=500 \
   --stop_after_training \
+  --setup_args.hf-token="${HF_TOKEN}" \
+  --setup_args.download-profile=sample \
   --train_args.output-dir=/workspace/checkpoints/griffin_alpha_finetune_object \
   --train_args.wandb-project-name="Bryce Test Griffin Alpha"
