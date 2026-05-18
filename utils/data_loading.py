@@ -212,34 +212,25 @@ class Abs2DeltaActionProcessorStep(lerobot.processor.ProcessorStep):
         return features
 
 @dataclass
-@lerobot.processor.ProcessorStepRegistry.register("se3_matrix_to_xyz_angles_processor")
-class SE3MatrixToXYZAnglesProcessorStep(lerobot.processor.ProcessorStep):
+@lerobot.processor.ProcessorStepRegistry.register("se3_matrix_to_xyz_rot6d_processor")
+class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
     """
-    Convert SE(3) matrices in the action tensor to XYZ and angles.
+    Convert SE(3) matrices in the action tensor to XYZ and rot6d.
     """
     se3_segment_start_idxs: Set[int]
     state_key: str = 'observation.state'
 
-    PER_SE3_MATRIX_DIM_REDUCTION = 10   # 16 dimensions -> 6 dimensions
+    PER_SE3_MATRIX_DIM_REDUCTION = 7   # 16 dimensions -> 9 dimensions
 
     def __post_init__(self):
         self.segmenter = EmbeddedSE3Segmenter(self.se3_segment_start_idxs)
 
     @staticmethod
     def convert(action: torch.Tensor) -> torch.Tensor:
-        r = action[..., :3, :3]
-        t = action[..., :3, 3]
-
-        sin_pitch = -r[..., 2, 0]
-        cos_pitch = torch.sqrt(
-            torch.clamp(r[..., 2, 1] ** 2 + r[..., 2, 2] ** 2, min=0.0)
+        return torch.cat(
+            [action[..., :3, 3], action[..., :3, :2].flatten(start_dim = -2)],
+            dim = -1,
         )
-        alpha = torch.atan2(r[..., 2, 1], r[..., 2, 2])
-        beta = torch.atan2(sin_pitch, cos_pitch)
-        gamma = torch.atan2(r[..., 1, 0], r[..., 0, 0])
-
-        angles = torch.stack((alpha, beta, gamma), dim=-1)
-        return torch.cat((t, angles), dim=-1)
 
     def __call__(self, transition):
         new_transition = transition.copy()
@@ -332,7 +323,7 @@ def load_dataset(
 
     Preprocessing per sample:
     - Instance transform (dataset-specific merge, subtask, etc.).
-    - Absolute to delta actions, optional SE(3) matrix to XYZ and angles, optional resample, normalization.
+    - Absolute to delta actions, optional SE(3) matrix to XYZ and rot6d, optional resample, normalization.
     """
     root = pathlib.Path(root)
 
@@ -362,7 +353,7 @@ def load_dataset(
         for img_k in image_keys:
             delta_timestamps[img_k] = img_timestamps
 
-    # Load and prepare normalization stats
+    # Load and prepare normalization stats.
     raw_norm_stats = lerobot.datasets.io_utils.cast_stats_to_numpy(
         lerobot.datasets.io_utils.load_json(root / 'delta_norm_stats.json')
     )['norm_stats']
@@ -377,7 +368,7 @@ def load_dataset(
     }
 
     
-    convert_se3_if_necessary = [SE3MatrixToXYZAnglesProcessorStep(
+    convert_se3_if_necessary = [SE3MatrixToXYZRot6DProcessorStep(
         se3_segment_start_idxs = se3_segment_start_idxs,
     )] if se3_segment_start_idxs else []
 
@@ -386,6 +377,12 @@ def load_dataset(
             target_chunk_size=canonical_action_chunk_size,
         )
     ] if load_action_chunk_size != canonical_action_chunk_size else []
+
+    if convert_se3_if_necessary and resample_step_if_necessary:
+        raise ValueError(
+            "Resampling and SE(3) matrices cannot be used at the same time, "
+            "as correct interpolation of SE(3) values is not implemented."
+        )
 
     processor_steps = [
         Abs2DeltaActionProcessorStep(

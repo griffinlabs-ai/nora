@@ -5,21 +5,19 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
+import numpy as np
 
 ACTION_DIM_IS_PAD = {
     'dual_arm_7dof': torch.tensor(
-        [False, False, False, False, False, False, False, False, True, True, True, True, True, True] * 2,
+        [False, False, False, False, False, False, False, True, True, False, True, True, True, True, True, True] * 2,
         dtype=torch.bool
     ),
     'dual_arm_6dof': torch.tensor(
-        [False, False, False, False, False, False, True, False, True, True, True, True, True, True] * 2,
+        [False, False, False, False, False, False, True, True, True, False, True, True, True, True, True, True] * 2,
         dtype=torch.bool
     ),
-    'single_arm_7dof': torch.tensor([False] * 8 + [True] * 20, dtype=torch.bool),
-    "egodex": torch.tensor(
-        [False, False, False, False, False, False, True, False, False, False, False, False, False, False] * 2,
-        dtype=torch.bool
-    ),
+    'single_arm_7dof': torch.tensor([False, False, False, False, False, False, False, True, True, False] + [True] * 22, dtype=torch.bool),
+    "egodex": torch.zeros(32, dtype=torch.bool),
 }
 
 MergeSpecItem = tuple[str, slice] | tuple[str, Literal['se3_matrix']] | tuple[float, int]
@@ -28,51 +26,54 @@ MergeSpec = Sequence[MergeSpecItem]
 MERGE_SPECS = {
     'agibot_world': (
         ('joint.position', slice(0, 7)),
+        (0.0, 2),
         ('effector.position', slice(0, 1)),
         (0.0, 6),
         ('joint.position', slice(7, 14)),
+        (0.0, 2),
         ('effector.position', slice(1, 2)),
         (0.0, 6),
     ),
     'galaxea': (
         ('left_arm', slice(None)),
-        (0.0, 1),
+        (0.0, 3),
         ('left_gripper', slice(None)),
         (0.0, 6),
         ('right_arm', slice(None)),
-        (0.0, 1),
+        (0.0, 3),
         ('right_gripper', slice(None)),
         (0.0, 6),
     ),
     'interndata_a1_franka': (
         ('joint.position', slice(None)),
+        (0.0, 2),
         ('gripper.position', slice(None)),
-        (0.0, 20),
+        (0.0, 22),
     ),
     'interndata_a1_genie1': (
         ('left_joint.position', slice(None)),
+        (0.0, 2),
         ('left_gripper.position', slice(None)),
         (0.0, 6),
         ('right_joint.position', slice(None)),
+        (0.0, 2),
         ('right_gripper.position', slice(None)),
         (0.0, 6),
     ),
     'interndata_a1_dual_arm_6dof': (
         ('left_joint.position', slice(None)),
-        (0.0, 1),
+        (0.0, 3),
         ('left_gripper.position', slice(None)),
         (0.0, 6),
         ('right_joint.position', slice(None)),
-        (0.0, 1),
+        (0.0, 3),
         ('right_gripper.position', slice(None)),
         (0.0, 6),
     ),
     'egodex': (
         ('leftHand', 'se3_matrix'),
-        (0.0, 1),
         ('leftFingers', slice(None)),
         ('rightHand', 'se3_matrix'),
-        (0.0, 1),
         ('rightFingers', slice(None)),
     ),
 }
@@ -106,7 +107,7 @@ def _make_merge_segment(
             return inst[f"{merge_prefix}.{feat}"][..., dims]
         case (str() as feat, 'se3_matrix'):
             # flatten based on leading dimensions, this can handle
-            # both the SE(3) matrix form (raw action / state) and the XYZ and angles form (norm stats)
+            # both the SE(3) matrix form (raw action / state) and the XYZ and rot6d form (norm stats)
             return inst[f"{merge_prefix}.{feat}"].view(*leading_dims, -1)
         case (float() as fill_value, int() as n_dims):
             return torch.full(
