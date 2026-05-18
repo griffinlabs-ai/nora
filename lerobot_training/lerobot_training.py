@@ -166,7 +166,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
             # 2. Extract Action Tokens
             action = transition['action'][i]
-            action = action[:, transition['complementary_data']['action_dim_is_pad'][i].logical_not()]
+            n_action_dims = int(transition['info']['n_action_dims'][i])
+            action = action[:, :n_action_dims]
             fast_tokens = self.fast_tokenizer(action.cpu())[0]
             vlm_action = map_fast_token_to_vlm_action(fast_tokens)
             

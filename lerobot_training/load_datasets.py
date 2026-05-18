@@ -7,76 +7,65 @@ from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
 import numpy as np
 
-ACTION_DIM_IS_PAD = {
-    'dual_arm_7dof': torch.tensor(
-        [False, False, False, False, False, False, False, True, True, False, True, True, True, True, True, True] * 2,
-        dtype=torch.bool
-    ),
-    'dual_arm_6dof': torch.tensor(
-        [False, False, False, False, False, False, True, True, True, False, True, True, True, True, True, True] * 2,
-        dtype=torch.bool
-    ),
-    'single_arm_7dof': torch.tensor([False, False, False, False, False, False, False, True, True, False] + [True] * 22, dtype=torch.bool),
-    "egodex": torch.zeros(32, dtype=torch.bool),
-}
+CANONICAL_ACTION_DIMS = 32
 
-MergeSpecItem = tuple[str, slice] | tuple[str, Literal['se3_matrix']] | tuple[float, int]
+MergeSpecItem = tuple[str, slice[int | None, int, None] | Literal['se3_matrix'], bool]
 MergeSpec = Sequence[MergeSpecItem]
 
 MERGE_SPECS = {
     'agibot_world': (
-        ('joint.position', slice(0, 7)),
-        (0.0, 2),
-        ('effector.position', slice(0, 1)),
-        (0.0, 6),
-        ('joint.position', slice(7, 14)),
-        (0.0, 2),
-        ('effector.position', slice(1, 2)),
-        (0.0, 6),
+        ('joint.position', slice(0, 7), True),
+        ('effector.position', slice(0, 1), False),
+        ('joint.position', slice(7, 14), True),
+        ('effector.position', slice(1, 2), False),
     ),
     'galaxea': (
-        ('left_arm', slice(None)),
-        (0.0, 3),
-        ('left_gripper', slice(None)),
-        (0.0, 6),
-        ('right_arm', slice(None)),
-        (0.0, 3),
-        ('right_gripper', slice(None)),
-        (0.0, 6),
+        ('left_arm', slice(0, 6), True),
+        ('left_gripper', slice(0, 1), False),
+        ('right_arm', slice(0, 6), True),
+        ('right_gripper', slice(0, 1), False),
     ),
     'interndata_a1_franka': (
-        ('joint.position', slice(None)),
-        (0.0, 2),
-        ('gripper.position', slice(None)),
-        (0.0, 22),
+        ('joint.position', slice(0, 7), True),
+        ('gripper.position', slice(0, 1), False),
     ),
     'interndata_a1_genie1': (
-        ('left_joint.position', slice(None)),
-        (0.0, 2),
-        ('left_gripper.position', slice(None)),
-        (0.0, 6),
-        ('right_joint.position', slice(None)),
-        (0.0, 2),
-        ('right_gripper.position', slice(None)),
-        (0.0, 6),
+        ('left_joint.position', slice(0, 7), True),
+        ('left_gripper.position', slice(0, 1), False),
+        ('right_joint.position', slice(0, 7), True),
+        ('right_gripper.position', slice(0, 1), False),
     ),
     'interndata_a1_dual_arm_6dof': (
-        ('left_joint.position', slice(None)),
-        (0.0, 3),
-        ('left_gripper.position', slice(None)),
-        (0.0, 6),
-        ('right_joint.position', slice(None)),
-        (0.0, 3),
-        ('right_gripper.position', slice(None)),
-        (0.0, 6),
+        ('left_joint.position', slice(0, 6), True),
+        ('left_gripper.position', slice(0, 1), False),
+        ('right_joint.position', slice(0, 6), True),
+        ('right_gripper.position', slice(0, 1), False),
     ),
     'egodex': (
-        ('leftHand', 'se3_matrix'),
-        ('leftFingers', slice(None)),
-        ('rightHand', 'se3_matrix'),
-        ('rightFingers', slice(None)),
+        ('leftHand', 'se3_matrix', True),
+        ('leftFingers', slice(0, 7), False),
+        ('rightHand', 'se3_matrix', True),
+        ('rightFingers', slice(0, 7), False),
     ),
 }
+
+
+def _get_merge_segment_dim(merge_spec_item: MergeSpecItem) -> int:
+    match merge_spec_item:
+        case (_, 'se3_matrix', _):
+            return 16
+        case (_, slice() as s, _):
+            return s.stop - (s.start or 0)
+        case _:
+            raise ValueError(f"Invalid merge spec item: {merge_spec_item}")
+
+@functools.cache
+def build_delta_transform_mask(merge_spec: MergeSpec) -> torch.Tensor:
+    parts = [
+        torch.full((_get_merge_segment_dim(item),), item[2], dtype=torch.bool)
+        for item in merge_spec
+    ]
+    return torch.cat(parts)
 
 def _agibot_subtask_from_meta(
     meta: LeRobotDatasetMetadata,
@@ -100,21 +89,14 @@ def _make_merge_segment(
     merge_prefix: str,
     merge_spec_item: MergeSpecItem,
     leading_dims: tuple[int, ...],
-    device: torch.device,
 ) -> torch.Tensor:
     match merge_spec_item:
-        case (str() as feat, slice() as dims):
+        case (str() as feat, slice() as dims, _):
             return inst[f"{merge_prefix}.{feat}"][..., dims]
-        case (str() as feat, 'se3_matrix'):
+        case (str() as feat, 'se3_matrix', _):
             # flatten based on leading dimensions, this can handle
             # both the SE(3) matrix form (raw action / state) and the XYZ and rot6d form (norm stats)
             return inst[f"{merge_prefix}.{feat}"].view(*leading_dims, -1)
-        case (float() as fill_value, int() as n_dims):
-            return torch.full(
-                (*leading_dims, n_dims),
-                fill_value = fill_value,
-                device = device,
-            )
         case _:
             raise ValueError(f"Invalid merge spec: {merge_spec_item}")
 
@@ -129,17 +111,16 @@ def merge_features(
     Feature keys starting with `merge_prefix` are removed from the instance dictionary.
     If `merged_feature_key` is not provided, the merged feature key is the same as the `merge_prefix`.
 
-    Merge spec is a list of tuples of:
-    -  feature key (without `merge_prefix`) and a slice object of dimensions to take, OR
-    -  a float value (which would be used for padding) and the number of dimensions to pad.
+    Merge spec is a list of (feature key, slice or 'se3_matrix', apply_delta) tuples.
+    The third element is used only by `build_delta_transform_mask`, not during merge.
 
     The merge output is a single tensor with the concatenated features dimensions.
     """
-    first_spec_item = next(item for item in merge_spec if item[0] is not None)
+    first_spec_item = merge_spec[0]
     first_feature_tensor = inst[f"{merge_prefix}.{first_spec_item[0]}"]
     leading_dims = first_feature_tensor.shape[:-1 if first_spec_item[1] != 'se3_matrix' else -2]
     to_cat = [
-        _make_merge_segment(inst, merge_prefix, merge_spec_item, leading_dims, first_feature_tensor.device)
+        _make_merge_segment(inst, merge_prefix, merge_spec_item, leading_dims)
         for merge_spec_item in merge_spec
     ]
 
@@ -171,12 +152,10 @@ def generic_to_nora_instance(
     merge_spec: MergeSpec,
     action_prefix: str,
     state_prefix: str,
-    action_dim_is_pad: torch.Tensor,
     embodiment_prompt: str,
 ):
     batch = merge_features(batch, action_prefix, merge_spec, 'action')
     batch = merge_features(batch, state_prefix, merge_spec, 'observation.state')
-    batch['action_dim_is_pad'] = action_dim_is_pad
     batch['info'] = {"embodiment_prompt": embodiment_prompt}
     if 'subtask' not in batch:
         batch['subtask'] = ""
@@ -204,7 +183,6 @@ def agibot_world_to_nora_instance(
         merge_spec = MERGE_SPECS['agibot_world'],
         action_prefix = 'actions',
         state_prefix = 'observation.states',
-        action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_7dof'],
         embodiment_prompt = "AgiBot G1 with 2 grippers",
     )
 
@@ -245,7 +223,6 @@ def galaxea_to_nora_instance(
         merge_spec = MERGE_SPECS['galaxea'],
         action_prefix = 'action',
         state_prefix = 'observation.state',
-        action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
         embodiment_prompt = "Galaxea R1 Lite",
     )
     # rename image keys, drop right head image
@@ -269,7 +246,6 @@ def galaxea_to_nora_instance(
 def interndata_a1_to_nora_instance(
     batch: dict[str, Any],
     merge_spec: MergeSpec,
-    action_dim_is_pad: torch.Tensor,
     embodiment_prompt: str,
     *,
     meta: object = None,
@@ -286,7 +262,6 @@ def interndata_a1_to_nora_instance(
         merge_spec = merge_spec,
         action_prefix = 'actions',
         state_prefix = 'states',
-        action_dim_is_pad = action_dim_is_pad,
         embodiment_prompt = embodiment_prompt,
     )
     batch = {k.replace('images.rgb.', 'observation.images.'): v for k, v in batch.items()}
@@ -295,19 +270,16 @@ def interndata_a1_to_nora_instance(
 interndata_a1_genie1_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
     merge_spec = MERGE_SPECS['interndata_a1_genie1'],
-    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_7dof'],
     embodiment_prompt = "InternData-A1 simulated Genie1 with 2 grippers",
 )
 interndata_a1_lift2_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
     merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
-    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Lift-2 with R5a arms",
 )
 interndata_a1_split_aloha_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
     merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
-    action_dim_is_pad = ACTION_DIM_IS_PAD['dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Split Aloha with 2 Piper-100 arms",
 )
 
@@ -320,7 +292,6 @@ def interndata_a1_franka_to_nora_instance(
     batch = interndata_a1_to_nora_instance(
         batch,
         merge_spec = MERGE_SPECS['interndata_a1_franka'],
-        action_dim_is_pad = ACTION_DIM_IS_PAD['single_arm_7dof'],
         embodiment_prompt = "InternData-A1 simulated Franka Emika Panda",
     )
     batch['observation.images.hand_left'] = batch['observation.images.hand']
@@ -338,7 +309,6 @@ def egodex_to_nora_instance(batch: dict[str, Any]):
         merge_spec = MERGE_SPECS['egodex'],
         action_prefix = 'action',
         state_prefix = 'observation.state',
-        action_dim_is_pad = ACTION_DIM_IS_PAD['egodex'],
         embodiment_prompt = "simplified real human hands (from Apple Vision Pro tracking)",
     )
     batch['observation.images.head'] = batch['observation.images.camera']
@@ -356,6 +326,7 @@ def load_agibot_world_dataset(
     canonical_action_chunk_size: int,
     num_frames: int = 1,
 ):
+    merge_spec = MERGE_SPECS['agibot_world']
     return load_dataset(
         root,
         ("actions.joint.position", "actions.effector.position"),
@@ -366,9 +337,11 @@ def load_agibot_world_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'actions',
-            merge_spec = MERGE_SPECS['agibot_world'],
+            merge_spec = merge_spec,
         ),
-        num_frames = num_frames
+        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )
 
 def load_galaxea_dataset(
@@ -377,6 +350,7 @@ def load_galaxea_dataset(
     num_frames: int = 1,
 ):
     assert canonical_action_chunk_size % 2 == 0
+    merge_spec = MERGE_SPECS['galaxea']
     return load_dataset(
         root,
         ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
@@ -387,9 +361,11 @@ def load_galaxea_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'action',
-            merge_spec = MERGE_SPECS['galaxea'],
+            merge_spec = merge_spec,
         ),
-        num_frames = num_frames
+        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )
 
 def load_interndata_a1_dataset(
@@ -398,6 +374,8 @@ def load_interndata_a1_dataset(
     num_frames: int = 1,
 ):
     root = pathlib.Path(root)
+    franka_merge_spec = MERGE_SPECS['interndata_a1_franka']
+    franka_delta_mask = build_delta_transform_mask(franka_merge_spec)
 
     franka_datasets = [
         load_dataset(
@@ -410,9 +388,11 @@ def load_interndata_a1_dataset(
             norm_stats_transform = functools.partial(
                 merge_norm_stats,
                 merge_prefix = 'actions',
-                merge_spec = MERGE_SPECS['interndata_a1_franka'],
+                merge_spec = franka_merge_spec,
             ),
-            num_frames = num_frames
+            delta_transform_mask = franka_delta_mask,
+            target_action_dim = CANONICAL_ACTION_DIMS,
+            num_frames = num_frames,
         )
         for i in ('1', '2')
     ]
@@ -422,6 +402,7 @@ def load_interndata_a1_dataset(
         "actions.right_joint.position",
         "actions.right_gripper.position",
     )
+    genie1_merge_spec = MERGE_SPECS['interndata_a1_genie1']
     genie1_dataset = load_dataset(
         root / 'genie1',
         dual_arm_action_keys,
@@ -432,14 +413,18 @@ def load_interndata_a1_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'actions',
-            merge_spec = MERGE_SPECS['interndata_a1_genie1'],
+            merge_spec = genie1_merge_spec,
         ),
-        num_frames = num_frames
+        delta_transform_mask = build_delta_transform_mask(genie1_merge_spec),
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )
+    dual_arm_6dof_merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof']
+    dual_arm_6dof_delta_mask = build_delta_transform_mask(dual_arm_6dof_merge_spec)
     dual_arm_6dof_norm_stats_transform = functools.partial(
         merge_norm_stats,
         merge_prefix = 'actions',
-        merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
+        merge_spec = dual_arm_6dof_merge_spec,
     )
     lift2_dataset = load_dataset(
         root / 'lift2',
@@ -449,7 +434,9 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_lift2_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
-        num_frames = num_frames
+        delta_transform_mask = dual_arm_6dof_delta_mask,
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )
     split_aloha_dataset = load_dataset(
         root / 'split_aloha',
@@ -459,7 +446,9 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_split_aloha_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
-        num_frames = num_frames
+        delta_transform_mask = dual_arm_6dof_delta_mask,
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )
     return ConcatDataset([*franka_datasets, genie1_dataset, lift2_dataset, split_aloha_dataset])
 
@@ -468,6 +457,7 @@ def load_egodex_dataset(
     canonical_action_chunk_size: int,
     num_frames: int = 1,
 ):
+    merge_spec = MERGE_SPECS['egodex']
     return load_dataset(
         root,
         ("action.leftHand", "action.rightHand", "action.leftFingers", "action.rightFingers"),
@@ -478,18 +468,10 @@ def load_egodex_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'action',
-            merge_spec = MERGE_SPECS['egodex'],
+            merge_spec = merge_spec,
         ),
         se3_segment_start_idxs = frozenset((0, 24)),
-        delta_transform_mask = torch.cat(
-            [
-                torch.ones(16), # left wrist SE(3)
-                torch.zeros(1), # left wrist padding
-                torch.zeros(7), # left fingers
-                torch.ones(16), # right wrist SE(3)
-                torch.zeros(1), # right wrist padding
-                torch.zeros(7), # right fingers
-            ],
-        ).bool(),
-        num_frames = num_frames
+        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
     )

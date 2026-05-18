@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, default_collate
 from typing import Any
 import pathlib
 import numpy as np
-from lerobot.configs.types import NormalizationMode, PolicyFeature, FeatureType
+from lerobot.configs.types import NormalizationMode, PipelineFeatureType, PolicyFeature, FeatureType
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 import lerobot.processor
 import lerobot.datasets.io_utils
@@ -268,6 +268,61 @@ class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
         )
         return features
 
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("pad_action_processor")
+class PadActionProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Pad action and state tensors to a fixed width after normalization.
+    Records the pre-pad dimension count in info['n_action_dims'].
+    """
+
+    target_dim: int
+    state_key: str = 'observation.state'
+
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        action = transition['action']
+        n = action.shape[-1]
+        if n > self.target_dim:
+            raise ValueError(
+                f"Action dim {n} exceeds target_dim {self.target_dim}; cannot pad."
+            )
+
+        info = dict(transition.get('info') or {})
+        info['n_action_dims'] = n
+        new_transition['info'] = info
+
+        if n < self.target_dim:
+            pad_width = self.target_dim - n
+            new_transition['action'] = torch.nn.functional.pad(
+                action, (0, pad_width),
+            )
+            observation = dict(transition['observation'])
+            observation[self.state_key] = torch.nn.functional.pad(
+                transition['observation'][self.state_key],
+                (0, pad_width),
+            )
+            new_transition['observation'] = observation
+
+        return new_transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        action_feat = features[PipelineFeatureType.ACTION]['action']
+        old_shape = action_feat.shape
+        features[PipelineFeatureType.ACTION]['action'] = PolicyFeature(
+            FeatureType.ACTION,
+            old_shape[:-1] + (self.target_dim,),
+        )
+        state_feat = features[PipelineFeatureType.OBSERVATION][self.state_key]
+        old_state_shape = state_feat.shape
+        features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
+            FeatureType.OBSERVATION,
+            old_state_shape[:-1] + (self.target_dim,),
+        )
+        return features
+
 def load_lerobot_dataset_skip_dirty_episodes(
     repo_id: str,
     root: str | pathlib.Path | None = None,
@@ -293,14 +348,6 @@ def load_task_config(task_root: pathlib.Path) -> dict[str, Any] | None:
         return json.load(f)
 
 
-DEFAULT_DELTA_TRANSFORM_MASK = torch.tensor(
-    [
-        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
-        True, True, True, True, True, True, True, False, False, False, False, False, False, False,
-    ],
-    dtype=torch.bool,
-)
-
 def load_dataset(
     root: str | pathlib.Path,
     action_keys: Iterable[str],
@@ -309,8 +356,9 @@ def load_dataset(
     raw_fps: int,
     instance_transform: Callable[..., dict[str, Any]],
     norm_stats_transform: Callable[[dict[str, dict[str, np.ndarray]]], dict[str, dict[str, np.ndarray]]],
+    delta_transform_mask: torch.Tensor,
+    target_action_dim: int,
     se3_segment_start_idxs: Set[int] | None = None,
-    delta_transform_mask: torch.Tensor | None = None,
     num_frames: int = 1,
 ) -> Dataset:
     """
@@ -323,7 +371,8 @@ def load_dataset(
 
     Preprocessing per sample:
     - Instance transform (dataset-specific merge, subtask, etc.).
-    - Absolute to delta actions, optional SE(3) matrix to XYZ and rot6d, optional resample, normalization.
+    - Absolute to delta actions, optional SE(3) matrix to XYZ and rot6d, optional resample,
+      normalization, then pad to target_action_dim.
     """
     root = pathlib.Path(root)
 
@@ -386,12 +435,13 @@ def load_dataset(
 
     processor_steps = [
         Abs2DeltaActionProcessorStep(
-            mask = delta_transform_mask if delta_transform_mask is not None else DEFAULT_DELTA_TRANSFORM_MASK,
+            mask = delta_transform_mask,
             se3_segment_start_idxs = se3_segment_start_idxs,
         ),
         *convert_se3_if_necessary,
         *resample_step_if_necessary,
         lerobot.processor.NormalizerProcessorStep({}, norm_map, norm_stats),
+        PadActionProcessorStep(target_dim = target_action_dim),
     ]
 
     preprocessed_subsets: list[PreprocessedDataset] = []
