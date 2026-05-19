@@ -255,16 +255,86 @@ class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
         return new_transition
     
     def transform_features(self, features):
-        old_shape = features['action'].shape
-        num_se3_segments = sum(1 for s, t in self.segmenter.slices if t == 'se3_matrix')
-        features['action']['action'] = PolicyFeature(
+        old_shape = features[PipelineFeatureType.ACTION]['action'].shape
+        num_se3_segments = sum(1 for _, t in self.segmenter.slices if t == 'se3_matrix')
+        features[PipelineFeatureType.ACTION]['action'] = PolicyFeature(
             FeatureType.ACTION,
             old_shape[:-1] + (old_shape[-1] - num_se3_segments * self.PER_SE3_MATRIX_DIM_REDUCTION,),
         )
-        old_shape = features['observation'][self.state_key].shape
-        features['observation'][self.state_key] = PolicyFeature(
+        old_shape = features[PipelineFeatureType.OBSERVATION][self.state_key].shape
+        features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
             FeatureType.OBSERVATION,
             old_shape[:-1] + (old_shape[-1] - num_se3_segments * self.PER_SE3_MATRIX_DIM_REDUCTION,),
+        )
+        return features
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("random_arm_control_mode_processor")
+class RandomArmControlModeProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Randomly keep either joint-position or EEF-pose arm control dimensions.
+
+    Gripper/finger dimensions should be included in both masks. The selected tensor is
+    compacted, then conditionally padded so that both modes have the same width.
+    """
+
+    joint_position_mode_mask: torch.Tensor
+    eef_pose_mode_mask: torch.Tensor
+    state_key: str = 'observation.state'
+
+    def __post_init__(self):
+        if self.joint_position_mode_mask.shape != self.eef_pose_mode_mask.shape:
+            raise ValueError(
+                "joint_position_mode_mask and eef_pose_mode_mask must have the same shape."
+            )
+        self.target_dim = max(
+            self.joint_position_mode_mask.sum().item(),
+            self.eef_pose_mode_mask.sum().item(),
+        )
+
+    def __call__(self, transition):
+        if torch.rand(()) < 0.5:
+            arm_control_mode = 'joint_position'
+            mask = self.joint_position_mode_mask
+        else:
+            arm_control_mode = 'eef_pose'
+            mask = self.eef_pose_mode_mask
+
+        new_transition = transition.copy()
+        new_transition['action'] = self._select_and_pad(transition['action'], mask)
+
+        observation = dict(transition['observation'])
+        observation[self.state_key] = self._select_and_pad(
+            transition['observation'][self.state_key],
+            mask,
+        )
+        new_transition['observation'] = observation
+
+        info = dict(transition.get('info') or {})
+        info['arm_control_mode'] = arm_control_mode
+        info['n_action_dims'] = int(mask.sum().item())
+        new_transition['info'] = info
+        return new_transition
+
+    def _select_and_pad(self, tensor: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        selected = tensor[..., mask]
+        return torch.nn.functional.pad(
+            selected,
+            (0, self.target_dim - selected.shape[-1]),
+        )
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        action_feat = features[PipelineFeatureType.ACTION]['action']
+        features[PipelineFeatureType.ACTION]['action'] = PolicyFeature(
+            FeatureType.ACTION,
+            action_feat.shape[:-1] + (self.target_dim,),
+        )
+        state_feat = features[PipelineFeatureType.OBSERVATION][self.state_key]
+        features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
+            FeatureType.OBSERVATION,
+            state_feat.shape[:-1] + (self.target_dim,),
         )
         return features
 
@@ -289,7 +359,7 @@ class PadActionProcessorStep(lerobot.processor.ProcessorStep):
             )
 
         info = dict(transition.get('info') or {})
-        info['n_action_dims'] = n
+        info.setdefault('n_action_dims', n)
         new_transition['info'] = info
 
         if n < self.target_dim:
@@ -359,6 +429,8 @@ def load_dataset(
     delta_transform_mask: torch.Tensor,
     target_action_dim: int,
     se3_segment_start_idxs: Set[int] | None = None,
+    joint_position_mode_mask: torch.Tensor | None = None,
+    eef_pose_mode_mask: torch.Tensor | None = None,
     num_frames: int = 1,
 ) -> Dataset:
     """
@@ -372,7 +444,7 @@ def load_dataset(
     Preprocessing per sample:
     - Instance transform (dataset-specific merge, subtask, etc.).
     - Absolute to delta actions, optional SE(3) matrix to XYZ and rot6d, optional resample,
-      normalization, then pad to target_action_dim.
+      normalization, optional arm-control-mode selection, then pad to target_action_dim.
     """
     root = pathlib.Path(root)
 
@@ -433,6 +505,13 @@ def load_dataset(
             "as correct interpolation of SE(3) values is not implemented."
         )
 
+    select_arm_control_mode_if_necessary = [
+        RandomArmControlModeProcessorStep(
+            joint_position_mode_mask = joint_position_mode_mask,
+            eef_pose_mode_mask = eef_pose_mode_mask,
+        )
+    ] if joint_position_mode_mask is not None and eef_pose_mode_mask is not None else []
+
     processor_steps = [
         Abs2DeltaActionProcessorStep(
             mask = delta_transform_mask,
@@ -441,6 +520,7 @@ def load_dataset(
         *convert_se3_if_necessary,
         *resample_step_if_necessary,
         lerobot.processor.NormalizerProcessorStep({}, norm_map, norm_stats),
+        *select_arm_control_mode_if_necessary,
         PadActionProcessorStep(target_dim = target_action_dim),
     ]
 

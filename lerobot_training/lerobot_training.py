@@ -174,9 +174,10 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             task = transition['complementary_data']['task'][i]
             subtask = transition['complementary_data']['subtask'][i]
             embodiment = transition['info']['embodiment_prompt'][i]
+            arm_control_mode = transition['info']['arm_control_mode'][i]
 
             # 3. Construct the message with image placeholders ONLY
-            content = [{"type": "text", "text": f"[embodiment: {embodiment}] "}]
+            content = [{"type": "text", "text": f"[embodiment: {embodiment}; arm control mode: {arm_control_mode}]"}]
             for _ in imgs_for_this_sample:
                 content.append({"type": "image"})
             content.append({"type": "text", "text": f"{task}\npredict subtask: {'true' if subtask else 'false'}"})

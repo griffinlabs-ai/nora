@@ -5,6 +5,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from torch.utils.data import ConcatDataset
 from utils.data_loading import load_dataset
+from utils.se3 import position_quaternion_xyzw_to_se3, pose_xyz_wxyz_to_se3
 import numpy as np
 
 CANONICAL_ACTION_DIMS = 32
@@ -22,8 +23,10 @@ ActionTensorSpec = Sequence[ActionTensorSegmentSpec]
 ACTION_TENSOR_SPECS = {
     'agibot_world': (
         ActionTensorSegmentSpec('joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('left_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('effector.position', slice(0, 1), 'gripper_joints'),
         ActionTensorSegmentSpec('joint.position', slice(7, 14), 'arm_joints'),
+        ActionTensorSegmentSpec('right_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('effector.position', slice(1, 2), 'gripper_joints'),
     ),
     'galaxea': (
@@ -38,14 +41,18 @@ ACTION_TENSOR_SPECS = {
     ),
     'interndata_a1_genie1': (
         ActionTensorSegmentSpec('left_joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('left_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('left_gripper.position', slice(0, 1), 'gripper_joints'),
         ActionTensorSegmentSpec('right_joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('right_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('right_gripper.position', slice(0, 1), 'gripper_joints'),
     ),
     'interndata_a1_dual_arm_6dof': (
         ActionTensorSegmentSpec('left_joint.position', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('left_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('left_gripper.position', slice(0, 1), 'gripper_joints'),
         ActionTensorSegmentSpec('right_joint.position', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('right_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('right_gripper.position', slice(0, 1), 'gripper_joints'),
     ),
     'egodex': (
@@ -57,25 +64,73 @@ ACTION_TENSOR_SPECS = {
 }
 
 
-def _get_delta_transform_mask_segment_dim(action_tensor_segment_spec: ActionTensorSegmentSpec) -> int:
+def _get_action_tensor_segment_dim(action_tensor_segment_spec: ActionTensorSegmentSpec, se3_dim: int) -> int:
     feature_slice = action_tensor_segment_spec.feature_slice
     if feature_slice == 'se3_matrix':
-        return 16
+        return se3_dim
     if isinstance(feature_slice, slice):
         return feature_slice.stop - (feature_slice.start or 0)
     raise ValueError(f"Invalid action tensor spec item: {action_tensor_segment_spec}")
 
-@functools.cache
 def build_delta_transform_mask(action_tensor_spec: ActionTensorSpec) -> torch.Tensor:
     parts = [
         torch.full(
-            (_get_delta_transform_mask_segment_dim(segment_spec),),
+            (_get_action_tensor_segment_dim(segment_spec, 16),),
             segment_spec.feature_type in ('arm_joints', 'eef_pose'),
             dtype=torch.bool,
         )
         for segment_spec in action_tensor_spec
     ]
     return torch.cat(parts)
+
+def build_se3_segment_start_idxs(action_tensor_spec: ActionTensorSpec) -> frozenset[int]:
+    start_idxs = set()
+    start_idx = 0
+    for segment_spec in action_tensor_spec:
+        if segment_spec.feature_slice == 'se3_matrix':
+            start_idxs.add(start_idx)
+        start_idx += _get_action_tensor_segment_dim(segment_spec, 16)
+    return frozenset(start_idxs)
+
+def build_arm_control_mode_masks(action_tensor_spec: ActionTensorSpec) -> tuple[torch.Tensor, torch.Tensor]:
+    joint_position_mask_parts = []
+    eef_pose_mask_parts = []
+    for segment_spec in action_tensor_spec:
+        dim = _get_action_tensor_segment_dim(segment_spec, 9)
+        is_gripper = segment_spec.feature_type == 'gripper_joints'
+        joint_position_mask_parts.append(
+            torch.full((dim,), segment_spec.feature_type == 'arm_joints' or is_gripper, dtype=torch.bool)
+        )
+        eef_pose_mask_parts.append(
+            torch.full((dim,), segment_spec.feature_type == 'eef_pose' or is_gripper, dtype=torch.bool)
+        )
+    return torch.cat(joint_position_mask_parts), torch.cat(eef_pose_mask_parts)
+
+def _add_agibot_eef_pose_features(batch: dict[str, Any], prefix: str) -> None:
+    position = batch[f'{prefix}.end.position']
+    orientation = batch[f'{prefix}.end.orientation']
+    batch[f'{prefix}.left_eef_pose'] = position_quaternion_xyzw_to_se3(
+        position[..., 0, :],
+        orientation[..., 0, :],
+    )
+    batch[f'{prefix}.right_eef_pose'] = position_quaternion_xyzw_to_se3(
+        position[..., 1, :],
+        orientation[..., 1, :],
+    )
+
+def _add_interndata_a1_eef_pose_features(batch: dict[str, Any], prefix: str) -> None:
+    batch[f'{prefix}.left_eef_pose'] = pose_xyz_wxyz_to_se3(
+        batch[f'{prefix}.left_ee_to_robot_pose']
+    )
+    batch[f'{prefix}.right_eef_pose'] = pose_xyz_wxyz_to_se3(
+        batch[f'{prefix}.right_ee_to_robot_pose']
+    )
+
+def _add_arm_control_mode(batch: dict[str, Any], arm_control_mode: str | None) -> None:
+    if arm_control_mode is not None:
+        info = batch.get('info') or {}
+        info['arm_control_mode'] = arm_control_mode
+        batch['info'] = info
 
 def _agibot_subtask_from_meta(
     meta: LeRobotDatasetMetadata,
@@ -160,10 +215,12 @@ def generic_to_nora_instance(
     action_prefix: str,
     state_prefix: str,
     embodiment_prompt: str,
+    arm_control_mode: str | None = None,
 ):
     batch = merge_features(batch, action_prefix, action_tensor_spec, 'action')
     batch = merge_features(batch, state_prefix, action_tensor_spec, 'observation.state')
     batch['info'] = {"embodiment_prompt": embodiment_prompt}
+    _add_arm_control_mode(batch, arm_control_mode)
     if 'subtask' not in batch:
         batch['subtask'] = ""
     return batch
@@ -182,6 +239,8 @@ def agibot_world_to_nora_instance(
     - Subtask from episode `action_config` when the current frame falls in a segment.
     """
     batch['actions.effector.position'] = 1 - batch['actions.effector.position']
+    _add_agibot_eef_pose_features(batch, 'actions')
+    _add_agibot_eef_pose_features(batch, 'observation.states')
     ep_idx = batch['episode_index'].item()
     frame_idx = batch['frame_index'].item()
     batch['subtask'] = _agibot_subtask_from_meta(meta, ep_idx, frame_idx)
@@ -231,6 +290,7 @@ def galaxea_to_nora_instance(
         action_prefix = 'action',
         state_prefix = 'observation.state',
         embodiment_prompt = "Galaxea R1 Lite",
+        arm_control_mode = 'joint_position',
     )
     # rename image keys, drop right head image
     batch['observation.images.head'] = batch['observation.images.head_rgb']
@@ -254,6 +314,7 @@ def interndata_a1_to_nora_instance(
     batch: dict[str, Any],
     action_tensor_spec: ActionTensorSpec,
     embodiment_prompt: str,
+    arm_control_mode: str | None = None,
     *,
     meta: object = None,
     task_config: object = None,
@@ -264,12 +325,17 @@ def interndata_a1_to_nora_instance(
         elif key.startswith('actions.') and key.endswith('gripper.position'):
             batch[key] = batch[key].view(-1, 1)
 
+    if any(segment.feature_type == 'eef_pose' for segment in action_tensor_spec):
+        _add_interndata_a1_eef_pose_features(batch, 'actions')
+        _add_interndata_a1_eef_pose_features(batch, 'states')
+
     batch = generic_to_nora_instance(
         batch,
         action_tensor_spec = action_tensor_spec,
         action_prefix = 'actions',
         state_prefix = 'states',
         embodiment_prompt = embodiment_prompt,
+        arm_control_mode = arm_control_mode,
     )
     batch = {k.replace('images.rgb.', 'observation.images.'): v for k, v in batch.items()}
     return batch
@@ -300,6 +366,7 @@ def interndata_a1_franka_to_nora_instance(
         batch,
         action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_franka'],
         embodiment_prompt = "InternData-A1 simulated Franka Emika Panda",
+        arm_control_mode = 'joint_position',
     )
     batch['observation.images.hand_left'] = batch['observation.images.hand']
     batch['observation.images.hand_right'] = None
@@ -317,6 +384,7 @@ def egodex_to_nora_instance(batch: dict[str, Any]):
         action_prefix = 'action',
         state_prefix = 'observation.state',
         embodiment_prompt = "simplified real human hands (from Apple Vision Pro tracking)",
+        arm_control_mode = 'eef_pose',
     )
     batch['observation.images.head'] = batch['observation.images.camera']
     batch['observation.images.hand_left'] = None
@@ -334,9 +402,15 @@ def load_agibot_world_dataset(
     num_frames: int = 1,
 ):
     action_tensor_spec = ACTION_TENSOR_SPECS['agibot_world']
+    joint_position_mode_mask, eef_pose_mode_mask = build_arm_control_mode_masks(action_tensor_spec)
     return load_dataset(
         root,
-        ("actions.joint.position", "actions.effector.position"),
+        (
+            "actions.joint.position",
+            "actions.end.position",
+            "actions.end.orientation",
+            "actions.effector.position",
+        ),
         canonical_action_chunk_size,
         canonical_action_chunk_size,
         raw_fps = 30,
@@ -346,7 +420,10 @@ def load_agibot_world_dataset(
             merge_prefix = 'actions',
             action_tensor_spec = action_tensor_spec,
         ),
+        se3_segment_start_idxs = build_se3_segment_start_idxs(action_tensor_spec),
         delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
+        joint_position_mode_mask = joint_position_mode_mask,
+        eef_pose_mode_mask = eef_pose_mode_mask,
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
@@ -405,11 +482,16 @@ def load_interndata_a1_dataset(
     ]
     dual_arm_action_keys = (
         "actions.left_joint.position",
+        "actions.left_ee_to_robot_pose",
         "actions.left_gripper.position",
         "actions.right_joint.position",
+        "actions.right_ee_to_robot_pose",
         "actions.right_gripper.position",
     )
     genie1_action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_genie1']
+    genie1_joint_position_mode_mask, genie1_eef_pose_mode_mask = build_arm_control_mode_masks(
+        genie1_action_tensor_spec
+    )
     genie1_dataset = load_dataset(
         root / 'genie1',
         dual_arm_action_keys,
@@ -422,12 +504,18 @@ def load_interndata_a1_dataset(
             merge_prefix = 'actions',
             action_tensor_spec = genie1_action_tensor_spec,
         ),
+        se3_segment_start_idxs = build_se3_segment_start_idxs(genie1_action_tensor_spec),
         delta_transform_mask = build_delta_transform_mask(genie1_action_tensor_spec),
+        joint_position_mode_mask = genie1_joint_position_mode_mask,
+        eef_pose_mode_mask = genie1_eef_pose_mode_mask,
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
     dual_arm_6dof_action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_dual_arm_6dof']
     dual_arm_6dof_delta_mask = build_delta_transform_mask(dual_arm_6dof_action_tensor_spec)
+    dual_arm_6dof_joint_position_mode_mask, dual_arm_6dof_eef_pose_mode_mask = build_arm_control_mode_masks(
+        dual_arm_6dof_action_tensor_spec
+    )
     dual_arm_6dof_norm_stats_transform = functools.partial(
         merge_norm_stats,
         merge_prefix = 'actions',
@@ -441,7 +529,10 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_lift2_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+        se3_segment_start_idxs = build_se3_segment_start_idxs(dual_arm_6dof_action_tensor_spec),
         delta_transform_mask = dual_arm_6dof_delta_mask,
+        joint_position_mode_mask = dual_arm_6dof_joint_position_mode_mask,
+        eef_pose_mode_mask = dual_arm_6dof_eef_pose_mode_mask,
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
@@ -453,7 +544,10 @@ def load_interndata_a1_dataset(
         raw_fps = 30,
         instance_transform = interndata_a1_split_aloha_to_nora_instance,
         norm_stats_transform = dual_arm_6dof_norm_stats_transform,
+        se3_segment_start_idxs = build_se3_segment_start_idxs(dual_arm_6dof_action_tensor_spec),
         delta_transform_mask = dual_arm_6dof_delta_mask,
+        joint_position_mode_mask = dual_arm_6dof_joint_position_mode_mask,
+        eef_pose_mode_mask = dual_arm_6dof_eef_pose_mode_mask,
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
