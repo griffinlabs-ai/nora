@@ -1,6 +1,6 @@
 import functools
 import pathlib
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, NamedTuple, Sequence
 import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 from torch.utils.data import ConcatDataset
@@ -9,61 +9,71 @@ import numpy as np
 
 CANONICAL_ACTION_DIMS = 32
 
-MergeSpecItem = tuple[str, slice[int | None, int, None] | Literal['se3_matrix'], bool]
-MergeSpec = Sequence[MergeSpecItem]
+ActionFeatureType = Literal['arm_joints', 'eef_pose', 'gripper_joints']
+ActionFeatureSlice = slice[int | None, int, None] | Literal['se3_matrix']
 
-MERGE_SPECS = {
+class ActionTensorSegmentSpec(NamedTuple):
+    feature_name: str
+    feature_slice: ActionFeatureSlice
+    feature_type: ActionFeatureType
+
+ActionTensorSpec = Sequence[ActionTensorSegmentSpec]
+
+ACTION_TENSOR_SPECS = {
     'agibot_world': (
-        ('joint.position', slice(0, 7), True),
-        ('effector.position', slice(0, 1), False),
-        ('joint.position', slice(7, 14), True),
-        ('effector.position', slice(1, 2), False),
+        ActionTensorSegmentSpec('joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('effector.position', slice(0, 1), 'gripper_joints'),
+        ActionTensorSegmentSpec('joint.position', slice(7, 14), 'arm_joints'),
+        ActionTensorSegmentSpec('effector.position', slice(1, 2), 'gripper_joints'),
     ),
     'galaxea': (
-        ('left_arm', slice(0, 6), True),
-        ('left_gripper', slice(0, 1), False),
-        ('right_arm', slice(0, 6), True),
-        ('right_gripper', slice(0, 1), False),
+        ActionTensorSegmentSpec('left_arm', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('left_gripper', slice(0, 1), 'gripper_joints'),
+        ActionTensorSegmentSpec('right_arm', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('right_gripper', slice(0, 1), 'gripper_joints'),
     ),
     'interndata_a1_franka': (
-        ('joint.position', slice(0, 7), True),
-        ('gripper.position', slice(0, 1), False),
+        ActionTensorSegmentSpec('joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('gripper.position', slice(0, 1), 'gripper_joints'),
     ),
     'interndata_a1_genie1': (
-        ('left_joint.position', slice(0, 7), True),
-        ('left_gripper.position', slice(0, 1), False),
-        ('right_joint.position', slice(0, 7), True),
-        ('right_gripper.position', slice(0, 1), False),
+        ActionTensorSegmentSpec('left_joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('left_gripper.position', slice(0, 1), 'gripper_joints'),
+        ActionTensorSegmentSpec('right_joint.position', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('right_gripper.position', slice(0, 1), 'gripper_joints'),
     ),
     'interndata_a1_dual_arm_6dof': (
-        ('left_joint.position', slice(0, 6), True),
-        ('left_gripper.position', slice(0, 1), False),
-        ('right_joint.position', slice(0, 6), True),
-        ('right_gripper.position', slice(0, 1), False),
+        ActionTensorSegmentSpec('left_joint.position', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('left_gripper.position', slice(0, 1), 'gripper_joints'),
+        ActionTensorSegmentSpec('right_joint.position', slice(0, 6), 'arm_joints'),
+        ActionTensorSegmentSpec('right_gripper.position', slice(0, 1), 'gripper_joints'),
     ),
     'egodex': (
-        ('leftHand', 'se3_matrix', True),
-        ('leftFingers', slice(0, 7), False),
-        ('rightHand', 'se3_matrix', True),
-        ('rightFingers', slice(0, 7), False),
+        ActionTensorSegmentSpec('leftHand', 'se3_matrix', 'eef_pose'),
+        ActionTensorSegmentSpec('leftFingers', slice(0, 7), 'gripper_joints'),
+        ActionTensorSegmentSpec('rightHand', 'se3_matrix', 'eef_pose'),
+        ActionTensorSegmentSpec('rightFingers', slice(0, 7), 'gripper_joints'),
     ),
 }
 
 
-def _get_merge_segment_dim(merge_spec_item: MergeSpecItem) -> int:
-    match merge_spec_item:
-        case (_, 'se3_matrix', _):
-            return 16
-        case (_, slice() as s, _):
-            return s.stop - (s.start or 0)
-        case _:
-            raise ValueError(f"Invalid merge spec item: {merge_spec_item}")
+def _get_delta_transform_mask_segment_dim(action_tensor_segment_spec: ActionTensorSegmentSpec) -> int:
+    feature_slice = action_tensor_segment_spec.feature_slice
+    if feature_slice == 'se3_matrix':
+        return 16
+    if isinstance(feature_slice, slice):
+        return feature_slice.stop - (feature_slice.start or 0)
+    raise ValueError(f"Invalid action tensor spec item: {action_tensor_segment_spec}")
 
 @functools.cache
-def build_delta_transform_mask(merge_spec: MergeSpec) -> torch.Tensor:
+def build_delta_transform_mask(action_tensor_spec: ActionTensorSpec) -> torch.Tensor:
     parts = [
-        torch.full((_get_merge_segment_dim(item),), item[2], dtype=torch.bool)
-        for item in merge_spec
+        torch.full(
+            (_get_delta_transform_mask_segment_dim(segment_spec),),
+            segment_spec.feature_type in ('arm_joints', 'eef_pose'),
+            dtype=torch.bool,
+        )
+        for segment_spec in action_tensor_spec
     ]
     return torch.cat(parts)
 
@@ -87,23 +97,23 @@ def _agibot_subtask_from_meta(
 def _make_merge_segment(
     inst: dict[str, Any],
     merge_prefix: str,
-    merge_spec_item: MergeSpecItem,
+    segment_spec: ActionTensorSegmentSpec,
     leading_dims: tuple[int, ...],
 ) -> torch.Tensor:
-    match merge_spec_item:
-        case (str() as feat, slice() as dims, _):
-            return inst[f"{merge_prefix}.{feat}"][..., dims]
-        case (str() as feat, 'se3_matrix', _):
-            # flatten based on leading dimensions, this can handle
-            # both the SE(3) matrix form (raw action / state) and the XYZ and rot6d form (norm stats)
-            return inst[f"{merge_prefix}.{feat}"].view(*leading_dims, -1)
-        case _:
-            raise ValueError(f"Invalid merge spec: {merge_spec_item}")
+    feature_slice = segment_spec.feature_slice
+    feature = inst[f"{merge_prefix}.{segment_spec.feature_name}"]
+    if isinstance(feature_slice, slice):
+        return feature[..., feature_slice]
+    if feature_slice == 'se3_matrix':
+        # flatten based on leading dimensions, this can handle
+        # both the SE(3) matrix form (raw action / state) and the XYZ and rot6d form (norm stats)
+        return feature.view(*leading_dims, -1)
+    raise ValueError(f"Invalid action tensor spec item: {segment_spec}")
 
 def merge_features(
     inst: dict[str, Any],
     merge_prefix: str,
-    merge_spec: MergeSpec,
+    action_tensor_spec: ActionTensorSpec,
     merged_feature_key: str | None = None,
 ):
     """
@@ -111,17 +121,14 @@ def merge_features(
     Feature keys starting with `merge_prefix` are removed from the instance dictionary.
     If `merged_feature_key` is not provided, the merged feature key is the same as the `merge_prefix`.
 
-    Merge spec is a list of (feature key, slice or 'se3_matrix', apply_delta) tuples.
-    The third element is used only by `build_delta_transform_mask`, not during merge.
-
     The merge output is a single tensor with the concatenated features dimensions.
     """
-    first_spec_item = merge_spec[0]
-    first_feature_tensor = inst[f"{merge_prefix}.{first_spec_item[0]}"]
-    leading_dims = first_feature_tensor.shape[:-1 if first_spec_item[1] != 'se3_matrix' else -2]
+    first_segment_spec = action_tensor_spec[0]
+    first_feature_tensor = inst[f"{merge_prefix}.{first_segment_spec.feature_name}"]
+    leading_dims = first_feature_tensor.shape[:-1 if first_segment_spec.feature_slice != 'se3_matrix' else -2]
     to_cat = [
-        _make_merge_segment(inst, merge_prefix, merge_spec_item, leading_dims)
-        for merge_spec_item in merge_spec
+        _make_merge_segment(inst, merge_prefix, segment_spec, leading_dims)
+        for segment_spec in action_tensor_spec
     ]
 
     new_inst = {k: v for k, v in inst.items() if not k.startswith(merge_prefix + '.')}
@@ -131,15 +138,15 @@ def merge_features(
 def merge_norm_stats(
     norm_stats: dict[str, dict[str, np.ndarray]],
     merge_prefix: str,
-    merge_spec: MergeSpec,
+    action_tensor_spec: ActionTensorSpec,
 ) -> dict[str, dict[str, np.ndarray]]:
     norm_stats = {
         'q01': {feat: torch.from_numpy(norm_stats[feat]['q01']).view(-1) for feat in norm_stats},
         'q99': {feat: torch.from_numpy(norm_stats[feat]['q99']).view(-1) for feat in norm_stats},
     }
     merged = {
-        'q01': merge_features(norm_stats['q01'], merge_prefix, merge_spec, 'action'),
-        'q99': merge_features(norm_stats['q99'], merge_prefix, merge_spec, 'action'),
+        'q01': merge_features(norm_stats['q01'], merge_prefix, action_tensor_spec, 'action'),
+        'q99': merge_features(norm_stats['q99'], merge_prefix, action_tensor_spec, 'action'),
     }
     merged = {
         feat: {'q01': merged['q01'][feat].numpy(), 'q99': merged['q99'][feat].numpy()}
@@ -149,13 +156,13 @@ def merge_norm_stats(
 
 def generic_to_nora_instance(
     batch: dict[str, Any],
-    merge_spec: MergeSpec,
+    action_tensor_spec: ActionTensorSpec,
     action_prefix: str,
     state_prefix: str,
     embodiment_prompt: str,
 ):
-    batch = merge_features(batch, action_prefix, merge_spec, 'action')
-    batch = merge_features(batch, state_prefix, merge_spec, 'observation.state')
+    batch = merge_features(batch, action_prefix, action_tensor_spec, 'action')
+    batch = merge_features(batch, state_prefix, action_tensor_spec, 'observation.state')
     batch['info'] = {"embodiment_prompt": embodiment_prompt}
     if 'subtask' not in batch:
         batch['subtask'] = ""
@@ -180,7 +187,7 @@ def agibot_world_to_nora_instance(
     batch['subtask'] = _agibot_subtask_from_meta(meta, ep_idx, frame_idx)
     return generic_to_nora_instance(
         batch,
-        merge_spec = MERGE_SPECS['agibot_world'],
+        action_tensor_spec = ACTION_TENSOR_SPECS['agibot_world'],
         action_prefix = 'actions',
         state_prefix = 'observation.states',
         embodiment_prompt = "AgiBot G1 with 2 grippers",
@@ -220,7 +227,7 @@ def galaxea_to_nora_instance(
 
     batch = generic_to_nora_instance(
         batch,
-        merge_spec = MERGE_SPECS['galaxea'],
+        action_tensor_spec = ACTION_TENSOR_SPECS['galaxea'],
         action_prefix = 'action',
         state_prefix = 'observation.state',
         embodiment_prompt = "Galaxea R1 Lite",
@@ -245,7 +252,7 @@ def galaxea_to_nora_instance(
 
 def interndata_a1_to_nora_instance(
     batch: dict[str, Any],
-    merge_spec: MergeSpec,
+    action_tensor_spec: ActionTensorSpec,
     embodiment_prompt: str,
     *,
     meta: object = None,
@@ -259,7 +266,7 @@ def interndata_a1_to_nora_instance(
 
     batch = generic_to_nora_instance(
         batch,
-        merge_spec = merge_spec,
+        action_tensor_spec = action_tensor_spec,
         action_prefix = 'actions',
         state_prefix = 'states',
         embodiment_prompt = embodiment_prompt,
@@ -269,17 +276,17 @@ def interndata_a1_to_nora_instance(
 
 interndata_a1_genie1_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = MERGE_SPECS['interndata_a1_genie1'],
+    action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_genie1'],
     embodiment_prompt = "InternData-A1 simulated Genie1 with 2 grippers",
 )
 interndata_a1_lift2_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
+    action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Lift-2 with R5a arms",
 )
 interndata_a1_split_aloha_to_nora_instance = functools.partial(
     interndata_a1_to_nora_instance,
-    merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof'],
+    action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_dual_arm_6dof'],
     embodiment_prompt = "InternData-A1 simulated Split Aloha with 2 Piper-100 arms",
 )
 
@@ -291,7 +298,7 @@ def interndata_a1_franka_to_nora_instance(
 ):
     batch = interndata_a1_to_nora_instance(
         batch,
-        merge_spec = MERGE_SPECS['interndata_a1_franka'],
+        action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_franka'],
         embodiment_prompt = "InternData-A1 simulated Franka Emika Panda",
     )
     batch['observation.images.hand_left'] = batch['observation.images.hand']
@@ -306,7 +313,7 @@ def interndata_a1_franka_to_nora_instance(
 def egodex_to_nora_instance(batch: dict[str, Any]):
     batch = generic_to_nora_instance(
         batch,
-        merge_spec = MERGE_SPECS['egodex'],
+        action_tensor_spec = ACTION_TENSOR_SPECS['egodex'],
         action_prefix = 'action',
         state_prefix = 'observation.state',
         embodiment_prompt = "simplified real human hands (from Apple Vision Pro tracking)",
@@ -326,7 +333,7 @@ def load_agibot_world_dataset(
     canonical_action_chunk_size: int,
     num_frames: int = 1,
 ):
-    merge_spec = MERGE_SPECS['agibot_world']
+    action_tensor_spec = ACTION_TENSOR_SPECS['agibot_world']
     return load_dataset(
         root,
         ("actions.joint.position", "actions.effector.position"),
@@ -337,9 +344,9 @@ def load_agibot_world_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'actions',
-            merge_spec = merge_spec,
+            action_tensor_spec = action_tensor_spec,
         ),
-        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
@@ -350,7 +357,7 @@ def load_galaxea_dataset(
     num_frames: int = 1,
 ):
     assert canonical_action_chunk_size % 2 == 0
-    merge_spec = MERGE_SPECS['galaxea']
+    action_tensor_spec = ACTION_TENSOR_SPECS['galaxea']
     return load_dataset(
         root,
         ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
@@ -361,9 +368,9 @@ def load_galaxea_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'action',
-            merge_spec = merge_spec,
+            action_tensor_spec = action_tensor_spec,
         ),
-        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
@@ -374,8 +381,8 @@ def load_interndata_a1_dataset(
     num_frames: int = 1,
 ):
     root = pathlib.Path(root)
-    franka_merge_spec = MERGE_SPECS['interndata_a1_franka']
-    franka_delta_mask = build_delta_transform_mask(franka_merge_spec)
+    franka_action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_franka']
+    franka_delta_mask = build_delta_transform_mask(franka_action_tensor_spec)
 
     franka_datasets = [
         load_dataset(
@@ -388,7 +395,7 @@ def load_interndata_a1_dataset(
             norm_stats_transform = functools.partial(
                 merge_norm_stats,
                 merge_prefix = 'actions',
-                merge_spec = franka_merge_spec,
+                action_tensor_spec = franka_action_tensor_spec,
             ),
             delta_transform_mask = franka_delta_mask,
             target_action_dim = CANONICAL_ACTION_DIMS,
@@ -402,7 +409,7 @@ def load_interndata_a1_dataset(
         "actions.right_joint.position",
         "actions.right_gripper.position",
     )
-    genie1_merge_spec = MERGE_SPECS['interndata_a1_genie1']
+    genie1_action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_genie1']
     genie1_dataset = load_dataset(
         root / 'genie1',
         dual_arm_action_keys,
@@ -413,18 +420,18 @@ def load_interndata_a1_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'actions',
-            merge_spec = genie1_merge_spec,
+            action_tensor_spec = genie1_action_tensor_spec,
         ),
-        delta_transform_mask = build_delta_transform_mask(genie1_merge_spec),
+        delta_transform_mask = build_delta_transform_mask(genie1_action_tensor_spec),
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
-    dual_arm_6dof_merge_spec = MERGE_SPECS['interndata_a1_dual_arm_6dof']
-    dual_arm_6dof_delta_mask = build_delta_transform_mask(dual_arm_6dof_merge_spec)
+    dual_arm_6dof_action_tensor_spec = ACTION_TENSOR_SPECS['interndata_a1_dual_arm_6dof']
+    dual_arm_6dof_delta_mask = build_delta_transform_mask(dual_arm_6dof_action_tensor_spec)
     dual_arm_6dof_norm_stats_transform = functools.partial(
         merge_norm_stats,
         merge_prefix = 'actions',
-        merge_spec = dual_arm_6dof_merge_spec,
+        action_tensor_spec = dual_arm_6dof_action_tensor_spec,
     )
     lift2_dataset = load_dataset(
         root / 'lift2',
@@ -457,7 +464,7 @@ def load_egodex_dataset(
     canonical_action_chunk_size: int,
     num_frames: int = 1,
 ):
-    merge_spec = MERGE_SPECS['egodex']
+    action_tensor_spec = ACTION_TENSOR_SPECS['egodex']
     return load_dataset(
         root,
         ("action.leftHand", "action.rightHand", "action.leftFingers", "action.rightFingers"),
@@ -468,10 +475,10 @@ def load_egodex_dataset(
         norm_stats_transform = functools.partial(
             merge_norm_stats,
             merge_prefix = 'action',
-            merge_spec = merge_spec,
+            action_tensor_spec = action_tensor_spec,
         ),
         se3_segment_start_idxs = frozenset((0, 24)),
-        delta_transform_mask = build_delta_transform_mask(merge_spec),
+        delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
