@@ -63,8 +63,11 @@ ACTION_TENSOR_SPECS = {
         ActionTensorSegmentSpec('rightHand', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('rightFingers', slice(0, 7), 'gripper_joints'),
     ),
+    'droid': (
+        ActionTensorSegmentSpec('action_all', slice(0, 7), 'arm_joints'),
+        ActionTensorSegmentSpec('action_all', slice(7, 8), 'gripper_joints'),
+    ),
 }
-
 
 def _get_action_tensor_segment_dim(action_tensor_segment_spec: ActionTensorSegmentSpec, se3_dim: int) -> int:
     feature_slice = action_tensor_segment_spec.feature_slice
@@ -483,6 +486,82 @@ def egodex_to_nora_instance(batch: dict[str, Any], *, meta: object = None, task_
         del batch['observation.images.camera_is_pad']
     return batch
 
+def droid_to_nora_instance(
+    batch: dict[str, Any],
+    *,
+    meta: object = None,
+    task_config: object = None,
+):
+    # 1. Map flat keys to dummy nested keys
+    if 'action' in batch:
+        batch['droid_actions.action_all'] = batch.pop('action')
+    if 'observation.state' in batch:
+        batch['droid_states.action_all'] = batch.pop('observation.state')
+
+    batch = generic_to_nora_instance(
+        batch,
+        action_tensor_spec = ACTION_TENSOR_SPECS['droid'],
+        action_prefix = 'droid_actions',
+        state_prefix = 'droid_states',
+        embodiment_prompt = "DROID platform with Franka Emika Panda, 1 gripper",
+        arm_control_mode = 'joint_position',
+    )
+
+    # 2. Language and task mapping
+    if meta is not None and hasattr(meta, 'tasks') and 'task_index' in batch:
+        task_idx = batch.pop('task_index')
+        if isinstance(task_idx, torch.Tensor):
+            task_idx = task_idx.item()
+        
+        try:
+            batch['task'] = meta.tasks.iloc[task_idx].name
+        except Exception:
+            batch['task'] = ""
+    else:
+        batch['task'] = ""
+        batch.pop('task_index', None)
+            
+    batch['subtask'] = ""
+
+    for lang_key in [
+        'annotation.language.language_instruction',
+        'annotation.language.language_instruction_2',
+        'annotation.language.language_instruction_3'
+    ]:
+        batch.pop(lang_key, None)
+
+    # 3. Handle DROID Image Tensors (利用 pop 的默认值大幅度精简)
+    batch['observation.images.head'] = batch.pop('observation.images.exterior_image_1_left', None)
+    batch['observation.images.hand_left'] = batch.pop('observation.images.wrist_image_left', None)
+    batch.pop('observation.images.exterior_image_2_left', None)
+    
+    batch['observation.images.hand_right'] = None
+
+    # 4. Conditional Padding Mask logic
+    has_pad = False
+    if 'observation.images.exterior_image_1_left_is_pad' in batch:
+        batch['observation.images.head_is_pad'] = batch.pop('observation.images.exterior_image_1_left_is_pad')
+        has_pad = True
+        
+    if 'observation.images.wrist_image_left_is_pad' in batch:
+        batch['observation.images.hand_left_is_pad'] = batch.pop('observation.images.wrist_image_left_is_pad')
+        has_pad = True
+        
+    batch.pop('observation.images.exterior_image_2_left_is_pad', None)
+
+    if has_pad:
+        batch['observation.images.hand_right_is_pad'] = None
+
+    return batch
+
+def droid_norm_stats_transform(
+    norm_stats: dict[str, dict[str, np.ndarray]],
+    action_tensor_spec: ActionTensorSpec
+) -> dict[str, dict[str, np.ndarray]]:
+    if 'action' in norm_stats:
+        norm_stats['droid_actions.action_all'] = norm_stats.pop('action')
+    return merge_norm_stats(norm_stats, 'droid_actions', action_tensor_spec)
+
 def load_agibot_world_dataset(
     root: str,
     canonical_action_chunk_size: int,
@@ -673,6 +752,32 @@ def load_egodex_dataset(
         ),
         se3_segment_start_idxs = frozenset((0, 24)),
         delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
+        target_action_dim = CANONICAL_ACTION_DIMS,
+        num_frames = num_frames,
+    )
+
+def load_droid_dataset(
+    root: str | pathlib.Path,
+    canonical_action_chunk_size: int,
+    num_frames: int = 1,
+):
+    root = pathlib.Path(root)
+    droid_action_tensor_spec = ACTION_TENSOR_SPECS['droid']
+    droid_delta_mask = build_delta_transform_mask(droid_action_tensor_spec)
+    action_keys = ("action",)
+    
+    return load_dataset(
+        root,
+        action_keys,
+        canonical_action_chunk_size // 2,
+        canonical_action_chunk_size,
+        raw_fps = 15,
+        instance_transform = droid_to_nora_instance,
+        norm_stats_transform = functools.partial(
+            droid_norm_stats_transform,
+            action_tensor_spec = droid_action_tensor_spec,
+        ),
+        delta_transform_mask = droid_delta_mask,
         target_action_dim = CANONICAL_ACTION_DIMS,
         num_frames = num_frames,
     )
