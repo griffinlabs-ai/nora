@@ -63,6 +63,7 @@ class TrainingConfig:
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
     action_vocab_size: int = 2048
+    proprio_vocab_size: int = 256
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
     # Number of image frames to input (5 past + 1 current = 6)
@@ -73,6 +74,19 @@ class TrainingConfig:
 def map_fast_token_to_vlm_action(tokens: List[str]) -> str:
     """Maps fast action tokens to the VLM action format."""
     return ''.join([f"<robot_action_{token}>" for token in tokens])
+
+def make_proprio_state_tokens(vocab_size: int) -> List[str]:
+    return [f"<proprio_state_{i}>" for i in range(vocab_size)]
+
+def map_normalized_state_to_vlm_proprio(state: torch.Tensor, vocab_size: int) -> str:
+    """Quantizes normalized proprio state values and maps them to VLM tokens."""
+    if vocab_size <= 0:
+        raise ValueError(f"proprio_vocab_size must be positive, got {vocab_size}")
+
+    clipped = state.clamp(-1.0, 1.0)
+    bucket_ids = torch.floor((clipped + 1.0) * (vocab_size / 2.0)).to(torch.long)
+    bucket_ids = bucket_ids.clamp(0, vocab_size - 1)
+    return ''.join(f"<proprio_state_{bucket_id}>" for bucket_id in bucket_ids.reshape(-1).tolist())
 
 class NoraImageTransform:
     """
@@ -137,6 +151,15 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         else:
             raise ValueError("Action Tokens not found in the Gemma vocabulary!")
 
+        proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
+        proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
+        proprio_ids = [
+            id for id in proprio_ids
+            if id is not None and id != self.transformer_processor.tokenizer.unk_token_id
+        ]
+        if len(proprio_ids) != self.config.proprio_vocab_size:
+            raise ValueError("Proprio state tokens not found in the Gemma vocabulary!")
+
         self.nora_image_transform = NoraImageTransform()
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
@@ -170,6 +193,12 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             action = action[:, :n_action_dims]
             fast_tokens = self.fast_tokenizer(action.cpu())[0]
             vlm_action = map_fast_token_to_vlm_action(fast_tokens)
+
+            proprio_state = obs_dict['observation.state'][i][:n_action_dims]
+            vlm_proprio = map_normalized_state_to_vlm_proprio(
+                proprio_state,
+                self.config.proprio_vocab_size,
+            )
             
             task = transition['complementary_data']['task'][i]
             subtask = transition['complementary_data']['subtask'][i]
@@ -177,7 +206,10 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             arm_control_mode = transition['info']['arm_control_mode'][i]
 
             # 3. Construct the message with image placeholders ONLY
-            content = [{"type": "text", "text": f"[embodiment: {embodiment}; arm control mode: {arm_control_mode}]"}]
+            content = [{
+                "type": "text",
+                "text": f"[embodiment: {embodiment}; arm control mode: {arm_control_mode}] {vlm_proprio}",
+            }]
             for _ in imgs_for_this_sample:
                 content.append({"type": "image"})
             content.append({"type": "text", "text": f"{task}\npredict subtask: {'true' if subtask else 'false'}"})
@@ -257,12 +289,15 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 
     old_vocab_size = len(transformer_processor.tokenizer)
     
-    # Inject action tokens
+    # Inject action and proprio state tokens
     action_tokens = [f"<robot_action_{i}>" for i in range(config.action_vocab_size)]
-    transformer_processor.tokenizer.add_tokens(action_tokens, special_tokens=True)
+    proprio_tokens = make_proprio_state_tokens(config.proprio_vocab_size)
+    transformer_processor.tokenizer.add_tokens(action_tokens + proprio_tokens, special_tokens=True)
     new_vocab_size = len(transformer_processor.tokenizer)
     
-    accelerator.print(f"Added {len(action_tokens)} action tokens to Gemma-4 vocabulary.")
+    accelerator.print(
+        f"Added {len(action_tokens)} action and {len(proprio_tokens)} proprio state tokens to Gemma-4 vocabulary."
+    )
     accelerator.print(f"Vocab size resized: {old_vocab_size} -> {new_vocab_size}")
 
     with accelerator.main_process_first():
