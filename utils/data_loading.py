@@ -263,7 +263,7 @@ class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
         )
         old_shape = features[PipelineFeatureType.OBSERVATION][self.state_key].shape
         features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
-            FeatureType.OBSERVATION,
+            FeatureType.STATE,
             old_shape[:-1] + (old_shape[-1] - num_se3_segments * self.PER_SE3_MATRIX_DIM_REDUCTION,),
         )
         return features
@@ -333,7 +333,7 @@ class RandomArmControlModeProcessorStep(lerobot.processor.ProcessorStep):
         )
         state_feat = features[PipelineFeatureType.OBSERVATION][self.state_key]
         features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
-            FeatureType.OBSERVATION,
+            FeatureType.STATE,
             state_feat.shape[:-1] + (self.target_dim,),
         )
         return features
@@ -388,7 +388,7 @@ class PadActionProcessorStep(lerobot.processor.ProcessorStep):
         state_feat = features[PipelineFeatureType.OBSERVATION][self.state_key]
         old_state_shape = state_feat.shape
         features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
-            FeatureType.OBSERVATION,
+            FeatureType.STATE,
             old_state_shape[:-1] + (self.target_dim,),
         )
         return features
@@ -486,6 +486,13 @@ def load_dataset(
 
     norm_map = {
         'ACTION': NormalizationMode.QUANTILES,
+        'STATE': NormalizationMode.QUANTILES,
+    }
+    normalizer_features = {
+        'observation.state': PolicyFeature(
+            FeatureType.STATE,
+            tuple(norm_stats['observation.state']['q01'].shape),
+        ),
     }
 
     
@@ -519,7 +526,12 @@ def load_dataset(
         ),
         *convert_se3_if_necessary,
         *resample_step_if_necessary,
-        lerobot.processor.NormalizerProcessorStep({}, norm_map, norm_stats),
+        lerobot.processor.NormalizerProcessorStep(
+            normalizer_features,
+            norm_map,
+            norm_stats,
+            normalize_observation_keys={'observation.state'},
+        ),
         *select_arm_control_mode_if_necessary,
         PadActionProcessorStep(target_dim = target_action_dim),
     ]

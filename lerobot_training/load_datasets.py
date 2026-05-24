@@ -11,7 +11,7 @@ import numpy as np
 CANONICAL_ACTION_DIMS = 32
 
 ActionFeatureType = Literal['arm_joints', 'eef_pose', 'gripper_joints', 'base_velocity']
-ActionFeatureSlice = slice[int | None, int, None] | Literal['se3_matrix']
+ActionFeatureSlice = slice | Literal['se3_matrix']
 
 class ActionTensorSegmentSpec(NamedTuple):
     feature_name: str
@@ -128,6 +128,15 @@ def _add_interndata_a1_eef_pose_features(batch: dict[str, Any], prefix: str) -> 
         batch[f'{prefix}.right_ee_to_robot_pose']
     )
 
+def _make_se3_features_relative_to(
+    batch: dict[str, Any],
+    reference: torch.Tensor,
+    feature_keys: Sequence[str],
+) -> None:
+    reference_inv = reference.inverse()
+    for feature_key in feature_keys:
+        batch[feature_key] = reference_inv.matmul(batch[feature_key])
+
 def _add_arm_control_mode(batch: dict[str, Any], arm_control_mode: str | None) -> None:
     if arm_control_mode is not None:
         info = batch.get('info') or {}
@@ -215,17 +224,43 @@ def merge_features(
 
 def merge_norm_stats(
     norm_stats: dict[str, dict[str, np.ndarray]],
-    merge_prefix: str,
+    action_prefix: str,
+    state_prefix: str,
     action_tensor_spec: ActionTensorSpec,
 ) -> dict[str, dict[str, np.ndarray]]:
     norm_stats = {
         'q01': {feat: torch.from_numpy(norm_stats[feat]['q01']).view(-1) for feat in norm_stats},
         'q99': {feat: torch.from_numpy(norm_stats[feat]['q99']).view(-1) for feat in norm_stats},
     }
+    # merge actions
     merged = {
-        'q01': merge_features(norm_stats['q01'], merge_prefix, action_tensor_spec, 'action'),
-        'q99': merge_features(norm_stats['q99'], merge_prefix, action_tensor_spec, 'action'),
+        stat_name: merge_features(stat, action_prefix, action_tensor_spec, 'action')
+        for stat_name, stat in norm_stats.items()
     }
+    # merge states
+    merged = {
+        stat_name: merge_features(
+            stat,
+            state_prefix,
+            action_tensor_spec,
+            'observation.state',
+            zero_fill_feature_types=frozenset(('base_velocity',)),
+        )
+        for stat_name, stat in merged.items()
+    }
+    # patch state norm stats for base velocity which should normalize to 0
+    zero_fill_state_mask = torch.cat([
+        torch.full(
+            (_get_action_tensor_segment_dim(segment_spec, 9),),
+            segment_spec.feature_type == 'base_velocity',
+            dtype=torch.bool,
+        )
+        for segment_spec in action_tensor_spec
+    ])
+    if zero_fill_state_mask.any():
+        merged['q01']['observation.state'][zero_fill_state_mask] = -1
+        merged['q99']['observation.state'][zero_fill_state_mask] = 1
+    # transpose back to original format
     merged = {
         feat: {'q01': merged['q01'][feat].numpy(), 'q99': merged['q99'][feat].numpy()}
         for feat in merged['q01']
@@ -357,6 +392,18 @@ def interndata_a1_to_nora_instance(
     if any(segment.feature_type == 'eef_pose' for segment in action_tensor_spec):
         _add_interndata_a1_eef_pose_features(batch, 'actions')
         _add_interndata_a1_eef_pose_features(batch, 'states')
+        head_pose = pose_xyz_wxyz_to_se3(batch['head_camera_to_robot_extrinsics'])
+        _make_se3_features_relative_to(
+            batch,
+            head_pose,
+            (
+                'actions.left_eef_pose',
+                'actions.right_eef_pose',
+                'states.left_eef_pose',
+                'states.right_eef_pose',
+            ),
+        )
+
 
     batch = generic_to_nora_instance(
         batch,
@@ -407,6 +454,16 @@ def interndata_a1_franka_to_nora_instance(
     return batch
 
 def egodex_to_nora_instance(batch: dict[str, Any]):
+    _make_se3_features_relative_to(
+        batch,
+        batch['observation.state.camera'],
+        (
+            'action.leftHand',
+            'action.rightHand',
+            'observation.state.leftHand',
+            'observation.state.rightHand',
+        ),
+    )
     batch = generic_to_nora_instance(
         batch,
         action_tensor_spec = ACTION_TENSOR_SPECS['egodex'],
@@ -447,7 +504,8 @@ def load_agibot_world_dataset(
         instance_transform = agibot_world_to_nora_instance,
         norm_stats_transform = functools.partial(
             merge_norm_stats,
-            merge_prefix = 'actions',
+            action_prefix = 'actions',
+            state_prefix = 'observation.states',
             action_tensor_spec = action_tensor_spec,
         ),
         se3_segment_start_idxs = build_se3_segment_start_idxs(action_tensor_spec),
@@ -480,7 +538,8 @@ def load_galaxea_dataset(
         instance_transform = galaxea_to_nora_instance,
         norm_stats_transform = functools.partial(
             merge_norm_stats,
-            merge_prefix = 'action',
+            action_prefix = 'action',
+            state_prefix = 'observation.state',
             action_tensor_spec = action_tensor_spec,
         ),
         delta_transform_mask = build_delta_transform_mask(action_tensor_spec),
@@ -507,7 +566,8 @@ def load_interndata_a1_dataset(
             instance_transform = interndata_a1_franka_to_nora_instance,
             norm_stats_transform = functools.partial(
                 merge_norm_stats,
-                merge_prefix = 'actions',
+                action_prefix = 'actions',
+                state_prefix = 'states',
                 action_tensor_spec = franka_action_tensor_spec,
             ),
             delta_transform_mask = franka_delta_mask,
@@ -537,7 +597,8 @@ def load_interndata_a1_dataset(
         instance_transform = interndata_a1_genie1_to_nora_instance,
         norm_stats_transform = functools.partial(
             merge_norm_stats,
-            merge_prefix = 'actions',
+            action_prefix = 'actions',
+            state_prefix = 'states',
             action_tensor_spec = genie1_action_tensor_spec,
         ),
         se3_segment_start_idxs = build_se3_segment_start_idxs(genie1_action_tensor_spec),
@@ -554,7 +615,8 @@ def load_interndata_a1_dataset(
     )
     dual_arm_6dof_norm_stats_transform = functools.partial(
         merge_norm_stats,
-        merge_prefix = 'actions',
+        action_prefix = 'actions',
+        state_prefix = 'states',
         action_tensor_spec = dual_arm_6dof_action_tensor_spec,
     )
     lift2_dataset = load_dataset(
@@ -604,7 +666,8 @@ def load_egodex_dataset(
         instance_transform = egodex_to_nora_instance,
         norm_stats_transform = functools.partial(
             merge_norm_stats,
-            merge_prefix = 'action',
+            action_prefix = 'action',
+            state_prefix = 'observation.state',
             action_tensor_spec = action_tensor_spec,
         ),
         se3_segment_start_idxs = frozenset((0, 24)),
