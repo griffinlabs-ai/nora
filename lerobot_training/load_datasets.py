@@ -10,7 +10,7 @@ import numpy as np
 
 CANONICAL_ACTION_DIMS = 32
 
-ActionFeatureType = Literal['arm_joints', 'eef_pose', 'gripper_joints']
+ActionFeatureType = Literal['arm_joints', 'eef_pose', 'gripper_joints', 'base_velocity']
 ActionFeatureSlice = slice[int | None, int, None] | Literal['se3_matrix']
 
 class ActionTensorSegmentSpec(NamedTuple):
@@ -22,6 +22,7 @@ ActionTensorSpec = Sequence[ActionTensorSegmentSpec]
 
 ACTION_TENSOR_SPECS = {
     'agibot_world': (
+        ActionTensorSegmentSpec('robot.velocity', slice(0, 2), 'base_velocity'),
         ActionTensorSegmentSpec('joint.position', slice(0, 7), 'arm_joints'),
         ActionTensorSegmentSpec('left_eef_pose', 'se3_matrix', 'eef_pose'),
         ActionTensorSegmentSpec('effector.position', slice(0, 1), 'gripper_joints'),
@@ -30,6 +31,7 @@ ACTION_TENSOR_SPECS = {
         ActionTensorSegmentSpec('effector.position', slice(1, 2), 'gripper_joints'),
     ),
     'galaxea': (
+        ActionTensorSegmentSpec('chassis.velocities', slice(0, 3), 'base_velocity'),
         ActionTensorSegmentSpec('left_arm', slice(0, 6), 'arm_joints'),
         ActionTensorSegmentSpec('left_gripper', slice(0, 1), 'gripper_joints'),
         ActionTensorSegmentSpec('right_arm', slice(0, 6), 'arm_joints'),
@@ -97,12 +99,12 @@ def build_arm_control_mode_masks(action_tensor_spec: ActionTensorSpec) -> tuple[
     eef_pose_mask_parts = []
     for segment_spec in action_tensor_spec:
         dim = _get_action_tensor_segment_dim(segment_spec, 9)
-        is_gripper = segment_spec.feature_type == 'gripper_joints'
+        always_include = segment_spec.feature_type in ('gripper_joints', 'base_velocity')
         joint_position_mask_parts.append(
-            torch.full((dim,), segment_spec.feature_type == 'arm_joints' or is_gripper, dtype=torch.bool)
+            torch.full((dim,), segment_spec.feature_type == 'arm_joints' or always_include, dtype=torch.bool)
         )
         eef_pose_mask_parts.append(
-            torch.full((dim,), segment_spec.feature_type == 'eef_pose' or is_gripper, dtype=torch.bool)
+            torch.full((dim,), segment_spec.feature_type == 'eef_pose' or always_include, dtype=torch.bool)
         )
     return torch.cat(joint_position_mask_parts), torch.cat(eef_pose_mask_parts)
 
@@ -154,8 +156,17 @@ def _make_merge_segment(
     merge_prefix: str,
     segment_spec: ActionTensorSegmentSpec,
     leading_dims: tuple[int, ...],
+    zero_fill_feature_types: frozenset[ActionFeatureType] = frozenset(),
+    reference_tensor: torch.Tensor | None = None,
 ) -> torch.Tensor:
     feature_slice = segment_spec.feature_slice
+    if segment_spec.feature_type in zero_fill_feature_types:
+        return torch.zeros(
+            *leading_dims,
+            _get_action_tensor_segment_dim(segment_spec, 16),
+            dtype=reference_tensor.dtype,
+            device=reference_tensor.device,
+        )
     feature = inst[f"{merge_prefix}.{segment_spec.feature_name}"]
     if isinstance(feature_slice, slice):
         return feature[..., feature_slice]
@@ -170,6 +181,7 @@ def merge_features(
     merge_prefix: str,
     action_tensor_spec: ActionTensorSpec,
     merged_feature_key: str | None = None,
+    zero_fill_feature_types: frozenset[ActionFeatureType] = frozenset(),
 ):
     """
     Merge features from the instance dictionary into a single feature.
@@ -178,11 +190,22 @@ def merge_features(
 
     The merge output is a single tensor with the concatenated features dimensions.
     """
-    first_segment_spec = action_tensor_spec[0]
+    first_segment_spec = next(
+        segment_spec
+        for segment_spec in action_tensor_spec
+        if segment_spec.feature_type not in zero_fill_feature_types
+    )
     first_feature_tensor = inst[f"{merge_prefix}.{first_segment_spec.feature_name}"]
     leading_dims = first_feature_tensor.shape[:-1 if first_segment_spec.feature_slice != 'se3_matrix' else -2]
     to_cat = [
-        _make_merge_segment(inst, merge_prefix, segment_spec, leading_dims)
+        _make_merge_segment(
+            inst,
+            merge_prefix,
+            segment_spec,
+            leading_dims,
+            zero_fill_feature_types,
+            first_feature_tensor,
+        )
         for segment_spec in action_tensor_spec
     ]
 
@@ -218,7 +241,13 @@ def generic_to_nora_instance(
     arm_control_mode: str | None = None,
 ):
     batch = merge_features(batch, action_prefix, action_tensor_spec, 'action')
-    batch = merge_features(batch, state_prefix, action_tensor_spec, 'observation.state')
+    batch = merge_features(
+        batch,
+        state_prefix,
+        action_tensor_spec,
+        'observation.state',
+        zero_fill_feature_types=frozenset(('base_velocity',)),
+    )
     batch['info'] = {"embodiment_prompt": embodiment_prompt}
     _add_arm_control_mode(batch, arm_control_mode)
     if 'subtask' not in batch:
@@ -406,6 +435,7 @@ def load_agibot_world_dataset(
     return load_dataset(
         root,
         (
+            "actions.robot.velocity",
             "actions.joint.position",
             "actions.end.position",
             "actions.end.orientation",
@@ -437,7 +467,13 @@ def load_galaxea_dataset(
     action_tensor_spec = ACTION_TENSOR_SPECS['galaxea']
     return load_dataset(
         root,
-        ("action.left_arm", "action.left_gripper", "action.right_arm", "action.right_gripper"),
+        (
+            "action.chassis.velocities",
+            "action.left_arm",
+            "action.left_gripper",
+            "action.right_arm",
+            "action.right_gripper",
+        ),
         canonical_action_chunk_size // 2,
         canonical_action_chunk_size,
         raw_fps = 15,
