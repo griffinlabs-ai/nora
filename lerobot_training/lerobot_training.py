@@ -16,11 +16,11 @@ if str(_root) not in sys.path:
 import math
 import os
 import logging
-from typing import List, Any, Optional, Tuple
+from typing import Iterator, List, Any, Optional, Sequence, Tuple
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 import torchvision.transforms as T_v2
 
 from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
@@ -68,6 +68,72 @@ class TrainingConfig:
     max_tokens_per_image: int = 70
     # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 1
+    dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.10, 0.10, 0.10)
+    dataloader_sampler_seed: int = 42
+
+
+class WeightedConcatRandomSampler(Sampler[int]):
+    """
+    Sample ConcatDataset child datasets by ratio without storing per-sample weights.
+
+    Dataset ids are sampled with replacement according to ``sample_ratios``. Once a dataset
+    id is chosen, the local sample index is sampled uniformly from that child dataset.
+    """
+
+    def __init__(
+        self,
+        datasets: Sequence[torch.utils.data.Dataset],
+        sample_ratios: Sequence[float],
+        num_samples: int | None = None,
+        seed: int = 42,
+    ):
+        if len(datasets) != len(sample_ratios):
+            raise ValueError(
+                f"Expected one sample ratio per dataset, got {len(sample_ratios)} ratios "
+                f"for {len(datasets)} datasets."
+            )
+
+        self.lengths = [len(dataset) for dataset in datasets]
+        if any(length <= 0 for length in self.lengths):
+            raise ValueError(f"All datasets must be non-empty, got lengths {self.lengths}.")
+
+        ratio_tensor = torch.as_tensor(sample_ratios, dtype=torch.float64)
+        if not torch.isfinite(ratio_tensor).all():
+            raise ValueError(f"Dataset sample ratios must be finite, got {sample_ratios}.")
+        if (ratio_tensor < 0).any():
+            raise ValueError(f"Dataset sample ratios must be non-negative, got {sample_ratios}.")
+        if ratio_tensor.sum().item() <= 0:
+            raise ValueError(f"At least one dataset sample ratio must be positive, got {sample_ratios}.")
+
+        self.probabilities = ratio_tensor / ratio_tensor.sum()
+        self.cumulative_offsets = [0]
+        for length in self.lengths[:-1]:
+            self.cumulative_offsets.append(self.cumulative_offsets[-1] + length)
+
+        self.num_samples = sum(self.lengths) if num_samples is None else num_samples
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples must be positive, got {self.num_samples}.")
+
+        self.seed = seed
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __iter__(self) -> Iterator[int]:
+        epoch = self.epoch
+        self.epoch += 1
+
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + epoch)
+
+        for _ in range(self.num_samples):
+            segment_index = int(torch.multinomial(self.probabilities, 1, generator=generator).item())
+            local_index = int(torch.randint(self.lengths[segment_index], (), generator=generator).item())
+            yield self.cumulative_offsets[segment_index] + local_index
 
 
 # --- 2. Data Preprocessing & Transforms ---
@@ -425,8 +491,23 @@ def train(config: TrainingConfig):
         canonical_action_chunk_size = config.action_chunk_size,
         num_frames = config.num_frames, 
     )
-    dataset = ConcatDataset([agibot_world, galaxea_open_world_ds, interndata_a1, egodex])
+    dataset_names = ("AgiBotWorld-Beta", "Galaxea A1", "InternVLA simulation", "EgoDex")
+    source_datasets = [agibot_world, galaxea_open_world_ds, interndata_a1, egodex]
+    dataset = ConcatDataset(source_datasets)
+    train_sampler = WeightedConcatRandomSampler(
+        source_datasets,
+        config.dataset_sample_ratios,
+        seed=config.dataloader_sampler_seed,
+    )
     accelerator.print(f"Total number of frames in dataset: {len(dataset)}")
+    for name, source_dataset, sample_ratio in zip(
+        dataset_names,
+        source_datasets,
+        train_sampler.probabilities.tolist(),
+        strict=True,
+    ):
+        accelerator.print(f"  {name}: {len(source_dataset)} frames, target sample ratio {sample_ratio:.1%}")
+    accelerator.print(f"Weighted sampler epoch length: {len(train_sampler)} samples")
 
     with accelerator.main_process_first():
         policy_preprocessor = make_policy_processor(config, transformer_processor)
@@ -435,7 +516,7 @@ def train(config: TrainingConfig):
         dataset,
         batch_size=config.per_device_batch_size,
         collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
-        shuffle=True,
+        sampler=train_sampler,
         num_workers=config.dataloader_num_workers,
         pin_memory=True,
     )
