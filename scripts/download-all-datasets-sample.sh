@@ -5,7 +5,7 @@ set -e
 hf download \
     --repo-type dataset \
     --local-dir ./data/agibot-world \
-    griffinlabs/AgiBot-World-Beta-arm-and-gripper-only \
+    griffinlabs/AgiBot-World-Beta-no-torso-movement \
     tasks/task_327/ \
     tasks/delta_norm_stats.json
 
@@ -15,9 +15,9 @@ hf download \
     --local-dir ./data/galaxea-open-world-dataset \
     griffinlabs/Galaxea-Open-World-Dataset-LeRobot-v3.0 \
     subsets/Adjust_The_Air_Conditioner_Temperature_20250711_006/ \
-    arm_and_gripper_only_delta_norm_stats.json
+    no_torso_delta_norm_stats.json
 mv \
-    ./data/galaxea-open-world-dataset/arm_and_gripper_only_delta_norm_stats.json \
+    ./data/galaxea-open-world-dataset/no_torso_delta_norm_stats.json \
     ./data/galaxea-open-world-dataset/delta_norm_stats.json
 
 # InternData-A1
