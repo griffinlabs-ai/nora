@@ -453,7 +453,7 @@ def interndata_a1_franka_to_nora_instance(
         del batch['observation.images.hand_is_pad']
     return batch
 
-def egodex_to_nora_instance(batch: dict[str, Any]):
+def egodex_to_nora_instance(batch: dict[str, Any], *, meta: object = None, task_config: object = None):
     _make_se3_features_relative_to(
         batch,
         batch['observation.state.camera'],
@@ -475,11 +475,12 @@ def egodex_to_nora_instance(batch: dict[str, Any]):
     batch['observation.images.head'] = batch['observation.images.camera']
     batch['observation.images.hand_left'] = None
     batch['observation.images.hand_right'] = None
-    batch['observation.images.head_is_pad'] = batch['observation.images.camera_is_pad']
-    batch['observation.images.hand_left_is_pad'] = None
-    batch['observation.images.hand_right_is_pad'] = None
     del batch['observation.images.camera']
-    del batch['observation.images.camera_is_pad']
+    if 'observation.images.camera_is_pad' in batch:
+        batch['observation.images.head_is_pad'] = batch['observation.images.camera_is_pad']
+        batch['observation.images.hand_left_is_pad'] = None
+        batch['observation.images.hand_right_is_pad'] = None
+        del batch['observation.images.camera_is_pad']
     return batch
 
 def load_agibot_world_dataset(
