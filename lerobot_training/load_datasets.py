@@ -524,30 +524,30 @@ def droid_to_nora_instance(
     batch['subtask'] = ""
 
     for lang_key in [
-        'annotation.language.language_instruction',
-        'annotation.language.language_instruction_2',
-        'annotation.language.language_instruction_3'
+        'language_instruction',
+        'language_instruction_2',
+        'language_instruction_3'
     ]:
         batch.pop(lang_key, None)
 
-    # 3. Handle DROID Image Tensors (利用 pop 的默认值大幅度精简)
-    batch['observation.images.head'] = batch.pop('observation.images.exterior_image_1_left', None)
-    batch['observation.images.hand_left'] = batch.pop('observation.images.wrist_image_left', None)
-    batch.pop('observation.images.exterior_image_2_left', None)
+    # 3. Handle Official DROID Image Tensors
+    batch['observation.images.head'] = batch.pop('observation.images.exterior_1_left', None)
+    batch['observation.images.hand_left'] = batch.pop('observation.images.wrist_left', None)
+    batch.pop('observation.images.exterior_2_left', None)
     
     batch['observation.images.hand_right'] = None
 
     # 4. Conditional Padding Mask logic
     has_pad = False
-    if 'observation.images.exterior_image_1_left_is_pad' in batch:
-        batch['observation.images.head_is_pad'] = batch.pop('observation.images.exterior_image_1_left_is_pad')
+    if 'observation.images.exterior_1_left_is_pad' in batch:
+        batch['observation.images.head_is_pad'] = batch.pop('observation.images.exterior_1_left_is_pad')
         has_pad = True
         
-    if 'observation.images.wrist_image_left_is_pad' in batch:
-        batch['observation.images.hand_left_is_pad'] = batch.pop('observation.images.wrist_image_left_is_pad')
+    if 'observation.images.wrist_left_is_pad' in batch:
+        batch['observation.images.hand_left_is_pad'] = batch.pop('observation.images.wrist_left_is_pad')
         has_pad = True
         
-    batch.pop('observation.images.exterior_image_2_left_is_pad', None)
+    batch.pop('observation.images.exterior_2_left_is_pad', None)
 
     if has_pad:
         batch['observation.images.hand_right_is_pad'] = None
@@ -764,6 +764,7 @@ def load_droid_dataset(
     root = pathlib.Path(root)
     droid_action_tensor_spec = ACTION_TENSOR_SPECS['droid']
     droid_delta_mask = build_delta_transform_mask(droid_action_tensor_spec)
+    
     action_keys = ("action",)
     
     return load_dataset(

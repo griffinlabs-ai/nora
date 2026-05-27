@@ -3,5 +3,5 @@ set -e
 
 hf download \
     --repo-type dataset \
-    --local-dir ./data/dreamzero-droid \
-    GEAR-Dreams/DreamZero-DROID-Data
+    --local-dir ./data/droid_1.0.1 \
+    lerobot/droid_1.0.1
