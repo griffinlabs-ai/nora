@@ -52,7 +52,7 @@ class TrainingConfig:
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
     agibot_world_root: str = "data/agibot-world/tasks"
-    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset/subsets"
+    galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
     egodex_root: str = "data/egodex/train"
     wandb_project_name: str = "Griffin Alpha"
@@ -541,8 +541,8 @@ def train(config: TrainingConfig):
                 for p in model.parameters())
     accelerator.print(f"Local params on rank {accelerator.process_index}: {local/1e9:.2f}B")
 
-    max_train_steps = len(train_dataloader) * config.max_epochs
-    max_optim_steps = math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs
+    max_train_steps = math.floor(len(train_dataloader) * config.max_epochs)
+    max_optim_steps = math.floor(math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs)
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
