@@ -55,6 +55,7 @@ class TrainingConfig:
     galaxea_open_world_ds_root: str = "data/galaxea-open-world-dataset"
     interndata_a1_root: str = "data/interndata-a1/"
     egodex_root: str = "data/egodex/train"
+    droid_root: str = "data/droid_1.0.1"
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
@@ -68,7 +69,7 @@ class TrainingConfig:
     max_tokens_per_image: int = 70
     # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 1
-    dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.10, 0.10, 0.10)
+    dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
     dataloader_sampler_seed: int = 42
 
 
@@ -486,13 +487,13 @@ def train(config: TrainingConfig):
         canonical_action_chunk_size = config.action_chunk_size,
         num_frames = config.num_frames, 
     )
-    egodex = load_datasets.load_egodex_dataset(
-        root = config.egodex_root,
+    droid = load_datasets.load_droid_dataset(
+        root = config.droid_root,
         canonical_action_chunk_size = config.action_chunk_size,
         num_frames = config.num_frames, 
     )
-    dataset_names = ("AgiBotWorld-Beta", "Galaxea A1", "InternVLA simulation", "EgoDex")
-    source_datasets = [agibot_world, galaxea_open_world_ds, interndata_a1, egodex]
+    dataset_names = ("AgiBotWorld-Beta", "Galaxea A1", "InternVLA simulation", "DROID")
+    source_datasets = [agibot_world, galaxea_open_world_ds, interndata_a1, droid]
     dataset = ConcatDataset(source_datasets)
     train_sampler = WeightedConcatRandomSampler(
         source_datasets,
