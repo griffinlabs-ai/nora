@@ -459,12 +459,13 @@ def load_dataset(
     }
     
     task_roots = [p.parent.parent for p in root.rglob('info.json')]
+    root_is_task_root = len(task_roots) == 1 and task_roots[0] == root
 
     # 2. Image timestamps (Past observation history)
     # We dynamically find the image keys from the first dataset to apply history frames
     if task_roots and num_frames > 1:
         
-        repo_id = str(task_roots[0].relative_to(root))
+        repo_id = str(task_roots[0].relative_to(root)) if not root_is_task_root else root.name
         meta = LeRobotDatasetMetadata(repo_id, root=task_roots[0])
         
         # Find all keys that represent images
@@ -544,7 +545,7 @@ def load_dataset(
         for task_root in tqdm_task_roots:
             tqdm_task_roots.set_description(f"Loading ds — {root}/{task_root.relative_to(root)}")
             ds = SkipEpisodesLeRobotDataset(
-                str(task_root.relative_to(root)),
+                str(task_root.relative_to(root)) if not root_is_task_root else root.name,
                 root=task_root,
                 delta_timestamps=delta_timestamps,
             )
