@@ -1,3 +1,4 @@
+import bisect
 from dataclasses import dataclass
 import functools
 import json
@@ -62,22 +63,24 @@ class SkipEpisodesLeRobotDataset(Dataset):
             self.skip_episodes = []
             self.skip_ranges = []
             self.keep_old_ranges = [range(0, len(self.lerobot_ds))]
-        # map new indices to old indices
-        self.new_ranges_to_old_offsets = {}
-        new_range_start = 0
+        # map new indices to old indices using binary-searchable range ends
+        self._new_range_ends = []
+        self._old_offsets = []
+        self._length = 0
         for old_range in self.keep_old_ranges:
-            new_range = range(new_range_start, new_range_start + len(old_range))
-            self.new_ranges_to_old_offsets[new_range] = old_range.start - new_range_start
-            new_range_start += len(old_range)
+            self._new_range_ends.append(self._length + len(old_range))
+            self._old_offsets.append(old_range.start - self._length)
+            self._length += len(old_range)
 
     def __len__(self) -> int:
-        return list(self.new_ranges_to_old_offsets)[-1].stop
+        return self._length
 
     def __getitem__(self, idx: int) -> dict:
-        # find the range that contains the new index
-        for new_range, old_offset in self.new_ranges_to_old_offsets.items():
-            if idx in new_range:
-                return self.lerobot_ds[idx + old_offset]
+        if idx < 0 or idx >= self._length:
+            raise IndexError(f"Index {idx} out of range")
+        range_idx = bisect.bisect_right(self._new_range_ends, idx)
+        if range_idx < len(self._old_offsets):
+            return self.lerobot_ds[idx + self._old_offsets[range_idx]]
         raise IndexError(f"Index {idx} out of range")
 
 @dataclass
