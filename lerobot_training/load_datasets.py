@@ -507,37 +507,16 @@ def droid_to_nora_instance(
         arm_control_mode = 'joint_position',
     )
 
-    # 2. Language and task mapping
-    if meta is not None and hasattr(meta, 'tasks') and 'task_index' in batch:
-        task_idx = batch.pop('task_index')
-        if isinstance(task_idx, torch.Tensor):
-            task_idx = task_idx.item()
-        
-        try:
-            batch['task'] = meta.tasks.iloc[task_idx].name
-        except Exception:
-            batch['task'] = ""
-    else:
-        batch['task'] = ""
-        batch.pop('task_index', None)
-            
     batch['subtask'] = ""
 
-    for lang_key in [
-        'language_instruction',
-        'language_instruction_2',
-        'language_instruction_3'
-    ]:
-        batch.pop(lang_key, None)
-
-    # 3. Handle Official DROID Image Tensors
+    # 2. Handle Official DROID Image Tensors
     batch['observation.images.head'] = batch.pop('observation.images.exterior_1_left', None)
     batch['observation.images.hand_left'] = batch.pop('observation.images.wrist_left', None)
-    batch.pop('observation.images.exterior_2_left', None)
+    batch.pop('observation.images.exterior_2_left', None) 
     
     batch['observation.images.hand_right'] = None
 
-    # 4. Conditional Padding Mask logic
+    # 3. Conditional Padding Mask logic
     has_pad = False
     if 'observation.images.exterior_1_left_is_pad' in batch:
         batch['observation.images.head_is_pad'] = batch.pop('observation.images.exterior_1_left_is_pad')
@@ -558,9 +537,19 @@ def droid_norm_stats_transform(
     norm_stats: dict[str, dict[str, np.ndarray]],
     action_tensor_spec: ActionTensorSpec
 ) -> dict[str, dict[str, np.ndarray]]:
+    
     if 'action' in norm_stats:
         norm_stats['droid_actions.action_all'] = norm_stats.pop('action')
-    return merge_norm_stats(norm_stats, 'droid_actions', action_tensor_spec)
+        
+    if 'observation.state' in norm_stats:
+        norm_stats['droid_states.action_all'] = norm_stats.pop('observation.state')
+
+    return merge_norm_stats(
+        norm_stats, 
+        'droid_actions', 
+        'droid_states', 
+        action_tensor_spec
+    )
 
 def load_agibot_world_dataset(
     root: str,
