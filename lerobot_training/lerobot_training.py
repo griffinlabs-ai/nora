@@ -221,7 +221,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
 
     def __post_init__(self):
         self.fast_tokenizer = AutoProcessor.from_pretrained(
-            "physical-intelligence/fast", trust_remote_code=True
+            "lerobot/fast-action-tokenizer", trust_remote_code=True
         )
         
         # Dynamically calculate Action Token range
@@ -338,7 +338,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         labels = batch_input['input_ids'].clone()
 
         # Mask out everything before the final start-of-turn token to calculate loss only on model output
-        sot_token_id = self.transformer_processor.tokenizer.sot_token_id
+        sot_token_id = self.transformer_processor.tokenizer.encode("<|im_start|>")[0]
         for i in range(labels.size(0)):
             seq = labels[i]
             sot_indices = (seq == sot_token_id).nonzero(as_tuple=False)
@@ -444,13 +444,7 @@ def train(config: TrainingConfig):
         fsdp_version = 2,
         reshard_after_forward=False,
         auto_wrap_policy="transformer_based_wrap",
-        state_dict_type="SHARDED_STATE_DICT",
-        transformer_cls_names_to_wrap=[
-            "Gemma4TextModel",
-            "Gemma4TextScaledWordEmbedding",
-            "Gemma4VisionEncoderLayer",
-            "Gemma4AudioLayer",
-        ]
+        state_dict_type="SHARDED_STATE_DICT"
     )
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,

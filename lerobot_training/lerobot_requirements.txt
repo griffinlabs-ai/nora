@@ -9,3 +9,5 @@ pillow
 safetensors
 tqdm
 lerobot==0.5.1
+torch==2.8
+torchcodec==0.7
