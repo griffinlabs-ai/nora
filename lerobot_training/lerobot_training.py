@@ -28,12 +28,14 @@ from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParal
 from accelerate.utils import TorchDynamoPlugin, FullyShardedDataParallelPlugin
 from accelerate.logging import get_logger
 
-# Use dynamic import to support different transformers versions for VLM base classes
-from transformers import AutoProcessor, get_scheduler
-from transformers import AutoModelForImageTextToText as AutoModelClass
+from transformers import AutoProcessor
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.configs.types import PipelineFeatureType
+from qwen_vl_utils import process_vision_info
 import numpy as np
 from tqdm import tqdm
 
@@ -65,11 +67,11 @@ class TrainingConfig:
     gradient_clipping: Optional[float] = None
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
-    model_id: str = "google/gemma-4-E4B-it"
+    model_id: str = "Qwen/Qwen3-VL-4B-Instruct" 
     action_vocab_size: int = 2048
     proprio_vocab_size: int = 256    
     # Standard vision target size
-    image_target_size: Tuple[int, int] = (224, 224) 
+    image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
     # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 1
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
@@ -160,18 +162,49 @@ def map_normalized_state_to_vlm_proprio(state: torch.Tensor, vocab_size: int) ->
 
 @dataclass
 class NoraImageTransform:
-    target_size: Tuple[int, int]
+    target_pixels: int
+    patch_size: int
+    merge_size: int
+    min_pixels: int
+    max_pixels: int
 
     def __post_init__(self):
         self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
-        self.crop_transform = T_v2.RandomResizedCrop(
-            size=self.target_size,
-            scale=(0.9, 1.0),
-            ratio=(0.9, 1.1),
+
+    @staticmethod
+    @lru_cache
+    def _get_random_resized_crop_transform(
+        target_pixels: int,
+        patch_size: int,
+        merge_size: int,
+        min_pixels: int,
+        max_pixels: int,
+        aspect_ratio: float,
+    ) -> T_v2.RandomResizedCrop:
+        resize_target = smart_resize(
+            (target_pixels / aspect_ratio)**0.5,
+            (target_pixels * aspect_ratio)**0.5,
+            factor = patch_size * merge_size,
+            min_pixels = min_pixels,
+            max_pixels = max_pixels,
+        )
+        return T_v2.RandomResizedCrop(
+            size=resize_target,
+            scale=(0.9, 0.9),
+            ratio=(aspect_ratio, aspect_ratio),
         )
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        image = self.crop_transform(image)
+        aspect_ratio = image.shape[-1] / image.shape[-2]
+        random_resized_crop_transform = self._get_random_resized_crop_transform(
+            self.target_pixels,
+            self.patch_size,
+            self.merge_size,
+            self.min_pixels,
+            self.max_pixels,
+            aspect_ratio,
+        )
+        image = random_resized_crop_transform(image)
         image = self.color_jitter(image)
         return image
 
@@ -204,7 +237,16 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             self.action_token_min = min(action_ids)
             self.action_token_max = max(action_ids)
         else:
-            raise ValueError("Action Tokens not found in the Gemma vocabulary!")
+            raise ValueError("Action Tokens not found in the Qwen3 vocabulary!")
+
+        proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
+        proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
+        proprio_ids = [
+            id for id in proprio_ids
+            if id is not None and id != self.transformer_processor.tokenizer.unk_token_id
+        ]
+        if len(proprio_ids) != self.config.proprio_vocab_size:
+            raise ValueError("Proprio state tokens not found in the Qwen3 vocabulary!")
 
         proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
         proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
@@ -216,7 +258,11 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             raise ValueError("Proprio state tokens not found in the Gemma vocabulary!")
 
         self.nora_image_transform = NoraImageTransform(
-            target_size = self.config.image_target_size
+            target_pixels = self.config.image_target_pixels,
+            patch_size = self.transformer_processor.image_processor.patch_size,
+            merge_size = self.transformer_processor.image_processor.merge_size,
+            min_pixels = self.transformer_processor.image_processor.size["shortest_edge"],
+            max_pixels = self.transformer_processor.image_processor.size["longest_edge"],
         )
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
@@ -330,18 +376,8 @@ def make_policy_processor(config: TrainingConfig, transformer_processor: Any) ->
 
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
-    """Loads Gemma-4, its processor, injects action tokens, and applies embedding hotfix."""
-    with accelerator.main_process_first():
-        transformer_processor = AutoProcessor.from_pretrained(
-            config.model_id,
-            trust_remote_code=True,
-            max_soft_tokens=config.max_tokens_per_image,
-            image_seq_length=config.max_tokens_per_image,
-        )
-    
-    # Ensure pad token exists
-    if transformer_processor.tokenizer.pad_token is None:
-        transformer_processor.tokenizer.pad_token = transformer_processor.tokenizer.eos_token
+    """Loads Qwen3, its processor, and injects action tokens."""
+    transformer_processor = AutoProcessor.from_pretrained(config.model_id, trust_remote_code=True)
     transformer_processor.tokenizer.padding_side = 'left'
 
     old_vocab_size = len(transformer_processor.tokenizer)
@@ -358,9 +394,10 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     accelerator.print(f"Vocab size resized: {old_vocab_size} -> {new_vocab_size}")
 
     with accelerator.main_process_first():
-        model = AutoModelClass.from_pretrained(
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
             config.model_id,
             torch_dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
             trust_remote_code=True,
             device_map=defaultdict(lambda: accelerator.device),
         )
