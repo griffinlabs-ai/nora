@@ -4,7 +4,6 @@ import sys
 import resource
 import pathlib
 from collections import defaultdict
-import traceback
 
 from torch.utils.data.dataset import ConcatDataset
 from torch.distributed.fsdp import FSDPModule
@@ -35,13 +34,10 @@ from transformers import get_scheduler
 
 import lerobot.processor
 from lerobot.configs.types import PipelineFeatureType
-from qwen_vl_utils import process_vision_info
-import numpy as np
 from tqdm import tqdm
 
 import load_datasets
-from utils.data_loading import collate_with_observation_image_lists, load_dataset
-import lerobot.processor.converters
+from utils.data_loading import collate_with_observation_image_lists
 
 logger = get_logger(__name__)
 
@@ -71,7 +67,7 @@ class TrainingConfig:
     action_vocab_size: int = 2048
     proprio_vocab_size: int = 256    
     # Standard vision target size
-    image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 256 patches
+    image_target_pixels: int = 65536   # mimimum size for Qwen3 VL, corresponds to 64 patch tokens
     # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 1
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
@@ -411,30 +407,6 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     if hasattr(model, 'config'):
         model.config.vocab_size = new_vocab_size
     accelerator.print("Done resizing token embedding layer.")
-
-    # =====================================================================
-    # [HOTFIX] Scan and force resize nested embedding layers missed by API
-    # =====================================================================
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Embedding) and module.num_embeddings == old_vocab_size:
-            accelerator.print(f"-> Hotfix: Resizing nested layer {name} from {old_vocab_size} to {new_vocab_size}")
-            
-            old_weight = module.weight.data
-            new_weight = torch.empty((new_vocab_size, module.embedding_dim), 
-                                     dtype=old_weight.dtype, 
-                                     device=old_weight.device)
-            new_weight[:old_vocab_size, :] = old_weight
-            
-            mean = old_weight.mean(dim=0)
-            std = old_weight.std(dim=0)
-            new_weight[old_vocab_size:, :] = torch.normal(
-                mean.expand(new_vocab_size - old_vocab_size, -1), 
-                std.expand(new_vocab_size - old_vocab_size, -1)
-            )
-            
-            module.num_embeddings = new_vocab_size
-            module.weight = torch.nn.Parameter(new_weight)
-    # =====================================================================
 
     if config.load_model_weights:
         tensors = {}
