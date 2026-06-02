@@ -64,9 +64,9 @@ class TrainingConfig:
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
     action_vocab_size: int = 2048
-    proprio_vocab_size: int = 256
-    # Gemma 4 image token budget
-    max_tokens_per_image: int = 70
+    proprio_vocab_size: int = 256    
+    # Standard vision target size
+    image_target_size: Tuple[int, int] = (224, 224) 
     # Number of image frames to input (5 past + 1 current = 6)
     num_frames: int = 1
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
@@ -155,35 +155,20 @@ def map_normalized_state_to_vlm_proprio(state: torch.Tensor, vocab_size: int) ->
     bucket_ids = bucket_ids.clamp(0, vocab_size - 1)
     return ''.join(f"<proprio_state_{bucket_id}>" for bucket_id in bucket_ids.reshape(-1).tolist())
 
+@dataclass
 class NoraImageTransform:
-    """
-    Image augmentation transforms for Nora policy training.
-    Applies relative-size random crop and color jitter.
-    """
+    target_size: Tuple[int, int]
 
-    BRIGHTNESS_FACTOR = 0.2
-    CONTRAST_FACTOR = 0.2
-    SATURATION_FACTOR = 0.2
-    HUE_FACTOR = 0.05
-    CROP_SCALE = 0.9
-
-    def __init__(self):
-        self.color_jitter = T_v2.ColorJitter(
-            brightness=self.BRIGHTNESS_FACTOR,
-            contrast=self.CONTRAST_FACTOR,
-            saturation=self.SATURATION_FACTOR,
-            hue=self.HUE_FACTOR,
+    def __post_init__(self):
+        self.color_jitter = T_v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)
+        self.crop_transform = T_v2.RandomResizedCrop(
+            size=self.target_size,
+            scale=(0.9, 1.0),
+            ratio=(0.9, 1.1),
         )
 
-    @staticmethod
-    @lru_cache(maxsize=None)
-    def get_random_crop_transform(source_size: Tuple[int, int], scale: float) -> T_v2.RandomCrop:
-        linear_scale = scale ** 0.5
-        target_size = round(source_size[0] * linear_scale), round(source_size[1] * linear_scale)
-        return T_v2.RandomCrop(target_size)
-
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
-        image = self.get_random_crop_transform(image.shape[-2:], self.CROP_SCALE)(image)
+        image = self.crop_transform(image)
         image = self.color_jitter(image)
         return image
 
@@ -227,7 +212,9 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         if len(proprio_ids) != self.config.proprio_vocab_size:
             raise ValueError("Proprio state tokens not found in the Gemma vocabulary!")
 
-        self.nora_image_transform = NoraImageTransform()
+        self.nora_image_transform = NoraImageTransform(
+            target_size = self.config.image_target_size
+        )
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
         batch_size = transition['action'].shape[0]
