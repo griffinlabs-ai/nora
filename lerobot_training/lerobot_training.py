@@ -572,15 +572,11 @@ def train(config: TrainingConfig):
     while completed_steps < max_train_steps:
         for batch in train_dataloader:
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
                 
                 outputs = model(**batch)
                 loss = outputs.loss
 
                 accelerator.backward(loss)
-
-                progress_bar.update(1)
-                completed_steps += 1
 
                 if accelerator.sync_gradients:
                     if config.gradient_clipping is not None:
@@ -588,6 +584,10 @@ def train(config: TrainingConfig):
 
                     optimizer.step()
                     lr_scheduler.step()
+                    optimizer.zero_grad() # zero grad after optimizer step, do not zero grad if still accumulating gradients
+
+                    progress_bar.update(1)
+                    completed_steps += 1 # only increment when its an actual optimizer update  
 
                     if completed_steps % config.logging_frequency == 0:
                         if accelerator.is_main_process:
