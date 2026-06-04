@@ -471,8 +471,8 @@ def load_dataset(
         # Find all keys that represent images
         image_keys = [k for k in meta.features.keys() if 'image' in k.lower()]
         
-        # LeRobot delta_timestamps are in seconds; use adjacent past frames.
-        img_timestamps = [(i - num_frames + 1) / raw_fps for i in range(num_frames)]
+        # Calculate timestamps for 5 past frames + 1 current frame
+        img_timestamps = [float(i - num_frames + 1) for i in range(num_frames)]
         
         # Apply the temporal window to all image streams
         for img_k in image_keys:
