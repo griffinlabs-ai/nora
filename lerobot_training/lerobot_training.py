@@ -233,7 +233,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             self.action_token_min = min(action_ids)
             self.action_token_max = max(action_ids)
         else:
-            raise ValueError("Action Tokens not found in the Qwen3 vocabulary!")
+            raise ValueError("Action Tokens not found in the model vocabulary!")
 
         proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
         proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
@@ -242,7 +242,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             if id is not None and id != self.transformer_processor.tokenizer.unk_token_id
         ]
         if len(proprio_ids) != self.config.proprio_vocab_size:
-            raise ValueError("Proprio state tokens not found in the Qwen3 vocabulary!")
+            raise ValueError("Proprio state tokens not found in the model vocabulary!")
 
         proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
         proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
@@ -251,7 +251,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             if id is not None and id != self.transformer_processor.tokenizer.unk_token_id
         ]
         if len(proprio_ids) != self.config.proprio_vocab_size:
-            raise ValueError("Proprio state tokens not found in the Gemma vocabulary!")
+            raise ValueError("Proprio state tokens not found in the model vocabulary!")
 
         self.nora_image_transform = NoraImageTransform(
             target_pixels = self.config.image_target_pixels,
@@ -385,7 +385,7 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     new_vocab_size = len(transformer_processor.tokenizer)
     
     accelerator.print(
-        f"Added {len(action_tokens)} action and {len(proprio_tokens)} proprio state tokens to Gemma-4 vocabulary."
+        f"Added {len(action_tokens)} action and {len(proprio_tokens)} proprio state tokens to model vocabulary."
     )
     accelerator.print(f"Vocab size resized: {old_vocab_size} -> {new_vocab_size}")
 
