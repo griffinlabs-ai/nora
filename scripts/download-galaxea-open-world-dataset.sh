@@ -13,7 +13,7 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/galaxea-open-world-dataset \
     griffinlabs/Galaxea-Open-World-Dataset-LeRobot-v3.0 \
-    $(sed 's/$/\//' < no-torso-subsets.txt)
+    $(sed 's/$/\//' < ./data/galaxea-open-world-dataset/no-torso-subsets.txt)
 
 # move delta norm stats to correct location
 mv \
