@@ -46,8 +46,8 @@ class TrainingConfig:
     per_device_batch_size: int = 32
     learning_rate: float = 5e-5
     gradient_accumulation_steps: int = 1
-    num_warmup_steps: int = 25000
-    max_epochs: int = 0.25
+    num_warmup_steps: int = 50000
+    max_epochs: int = 1
     output_dir: str = './griffin_alpha_finetune_object'
     resume_from_checkpoint: str = ''
     load_model_weights: Optional[str] = None
