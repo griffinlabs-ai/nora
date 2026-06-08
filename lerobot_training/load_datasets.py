@@ -498,6 +498,13 @@ def droid_to_nora_instance(
     if 'observation.state' in batch:
         batch['droid_states.action_all'] = batch.pop('observation.state')
 
+    # drop some keys because `merge_features()`'s logic doesn't
+    # automatically drop them (as they doesn't follow the `prefix.feature_name` format)
+    batch.pop('action_is_pad', None)
+    for k in batch.copy():
+        if k.startswith(('observation.state.', 'action.')):
+            batch.pop(k, None)
+
     batch = generic_to_nora_instance(
         batch,
         action_tensor_spec = ACTION_TENSOR_SPECS['droid'],
