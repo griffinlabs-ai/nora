@@ -386,8 +386,9 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
             device_map=defaultdict(lambda: accelerator.device),
         )
     
-    # freeze audio tower
-    model.audio_tower.requires_grad_(False)
+    # freeze audio components
+    model.model.audio_tower.requires_grad_(False)
+    model.model.embed_audio.requires_grad_(False)
 
     # Resize token embedding layers
     accelerator.print("Resizing token embedding layer.")
