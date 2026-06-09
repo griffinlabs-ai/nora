@@ -73,6 +73,17 @@ class TrainingConfig:
     dataloader_sampler_seed: int = 42
 
 
+@dataclass
+class TrainingState:
+    completed_steps: int = 0
+
+    def state_dict(self) -> dict[str, int]:
+        return {"completed_steps": self.completed_steps}
+
+    def load_state_dict(self, state_dict: dict[str, int]) -> None:
+        self.completed_steps = int(state_dict["completed_steps"])
+
+
 class WeightedConcatRandomSampler(Sampler[int]):
     """
     Sample ConcatDataset child datasets by ratio without storing per-sample weights.
@@ -374,6 +385,10 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
             trust_remote_code=True,
             device_map=defaultdict(lambda: accelerator.device),
         )
+    
+    # freeze audio components
+    model.model.audio_tower.requires_grad_(False)
+    model.model.embed_audio.requires_grad_(False)
 
     # Resize token embedding layers
     accelerator.print("Resizing token embedding layer.")
@@ -523,7 +538,7 @@ def train(config: TrainingConfig):
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=config.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=1e-8,
@@ -553,9 +568,13 @@ def train(config: TrainingConfig):
 
     lr_scheduler = accelerator.prepare(lr_scheduler)
 
+    training_state = TrainingState()
+    accelerator.register_for_checkpointing(training_state)
+
     if config.resume_from_checkpoint:
+        accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
         accelerator.load_state(config.resume_from_checkpoint)
-        accelerator.print(f"Resumed from local checkpoint: {config.resume_from_checkpoint}")
+        accelerator.print(f"Resumed from local checkpoint.")
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -566,8 +585,12 @@ def train(config: TrainingConfig):
     logger.info(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {max_optim_steps}")
 
-    completed_steps = 0
-    progress_bar = tqdm(range(completed_steps, max_train_steps), disable=not accelerator.is_local_main_process)
+    completed_steps = training_state.completed_steps
+    progress_bar = tqdm(
+        total=max_train_steps,
+        initial=completed_steps,
+        disable=not accelerator.is_local_main_process,
+    )
 
     while completed_steps < max_train_steps:
         for batch in train_dataloader:
@@ -579,6 +602,7 @@ def train(config: TrainingConfig):
                 accelerator.backward(loss)
                 progress_bar.update(1)
                 completed_steps += 1
+                training_state.completed_steps = completed_steps
 
                 if accelerator.sync_gradients:
                     if config.gradient_clipping is not None:
