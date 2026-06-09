@@ -610,7 +610,6 @@ def train(config: TrainingConfig):
 
                     optimizer.step()
                     lr_scheduler.step()
-                    optimizer.zero_grad() # zero grad after optimizer step, do not zero grad if still accumulating gradients
 
                     if completed_steps % config.logging_frequency == 0:
                         if accelerator.is_main_process:
@@ -624,6 +623,8 @@ def train(config: TrainingConfig):
 
                             logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
                             accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm":total_norm}, step=completed_steps)
+
+                    optimizer.zero_grad()
 
             if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                 accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
