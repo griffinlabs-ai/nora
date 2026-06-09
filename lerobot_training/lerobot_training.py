@@ -563,7 +563,7 @@ def train(config: TrainingConfig):
         name="cosine",
         optimizer=optimizer,
         num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps * accelerator.num_processes),
-        num_training_steps=max_optim_steps
+        num_training_steps=max_optim_steps * accelerator.num_processes
     )
 
     lr_scheduler = accelerator.prepare(lr_scheduler)
