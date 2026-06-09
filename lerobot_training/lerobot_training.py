@@ -573,7 +573,7 @@ def train(config: TrainingConfig):
 
     if config.resume_from_checkpoint:
         accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
-        accelerator.load_state(config.resume_from_checkpoint, strict=False)
+        accelerator.load_state(config.resume_from_checkpoint)
         accelerator.print(f"Resumed from local checkpoint.")
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
