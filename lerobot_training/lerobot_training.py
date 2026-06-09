@@ -44,7 +44,7 @@ logger = get_logger(__name__)
 @dataclass
 class TrainingConfig:
     per_device_batch_size: int = 32
-    learning_rate: float = 5e-5
+    learning_rate: float = 3e-5
     gradient_accumulation_steps: int = 1
     num_warmup_steps: int = 50000
     max_epochs: int = 1
