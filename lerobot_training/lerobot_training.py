@@ -385,6 +385,9 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
             trust_remote_code=True,
             device_map=defaultdict(lambda: accelerator.device),
         )
+    
+    # freeze audio tower
+    model.audio_tower.requires_grad_(False)
 
     # Resize token embedding layers
     accelerator.print("Resizing token embedding layer.")
@@ -534,7 +537,7 @@ def train(config: TrainingConfig):
     )
 
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        [p for p in model.parameters() if p.requires_grad],
         lr=config.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=1e-8,
@@ -568,8 +571,9 @@ def train(config: TrainingConfig):
     accelerator.register_for_checkpointing(training_state)
 
     if config.resume_from_checkpoint:
-        accelerator.load_state(config.resume_from_checkpoint)
-        accelerator.print(f"Resumed from local checkpoint: {config.resume_from_checkpoint}")
+        accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
+        accelerator.load_state(config.resume_from_checkpoint, strict=False)
+        accelerator.print(f"Resumed from local checkpoint.")
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
