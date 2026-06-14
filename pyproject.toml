@@ -1,0 +1,26 @@
+[project]
+name = "lerobot_policy_griffin_alpha"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest",
+    "transformers>=5.5",
+    "torchvision",
+    "accelerate",
+    "wheel",
+    "scipy",
+    "pillow",
+    "safetensors",
+    "tqdm",
+    "lerobot==0.5.1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=9.1.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-v"
