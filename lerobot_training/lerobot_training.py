@@ -59,7 +59,7 @@ class TrainingConfig:
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
-    gradient_clipping: Optional[float] = None
+    gradient_clipping: float = float('inf')
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
@@ -583,24 +583,21 @@ def train(config: TrainingConfig):
                 training_state.completed_steps = completed_steps
 
                 if accelerator.sync_gradients:
-                    if config.gradient_clipping is not None:
-                        accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+                    should_log = completed_steps % config.logging_frequency == 0
+
+                    if config.gradient_clipping != float('inf') or should_log:
+                        grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
+                        if isinstance(grad_norm, DTensor):
+                            grad_norm = grad_norm.full_tensor()
+                        grad_norm = grad_norm.item()
 
                     optimizer.step()
                     lr_scheduler.step()
 
-                    if completed_steps % config.logging_frequency == 0:
-                        if accelerator.is_main_process:
-                            total_norm = 0.0
-                            for p in model.parameters():
-                                if p.grad is not None:
-                                    total_norm += p.grad.data.norm(2).item() ** 2
-
-                            total_norm = total_norm**0.5
-                            lr = lr_scheduler.get_last_lr()[0]
-
-                            logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {total_norm}", main_process_only=True)
-                            accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm":total_norm}, step=completed_steps)
+                    if should_log and accelerator.is_main_process:
+                        lr = lr_scheduler.get_last_lr()[0]
+                        logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {grad_norm}", main_process_only=True)
+                        accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm": grad_norm}, step=completed_steps)
 
                     optimizer.zero_grad()
 
