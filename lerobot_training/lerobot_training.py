@@ -37,6 +37,7 @@ from tqdm import tqdm
 
 import load_datasets
 from utils.data_loading import collate_with_observation_image_lists
+from weighted_concat_shuffle_sampler import WeightedConcatShuffleSampler
 
 logger = get_logger(__name__)
 
@@ -59,7 +60,7 @@ class TrainingConfig:
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 20000
     logging_frequency: int = 100
-    gradient_clipping: float = float('inf')
+    gradient_clipping: float = 50
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
@@ -488,7 +489,7 @@ def train(config: TrainingConfig):
     dataset_names = ("AgiBotWorld-Beta", "Galaxea A1", "InternVLA simulation", "DROID")
     source_datasets = [agibot_world, galaxea_open_world_ds, interndata_a1, droid]
     dataset = ConcatDataset(source_datasets)
-    train_sampler = WeightedConcatRandomSampler(
+    train_sampler = WeightedConcatShuffleSampler(
         source_datasets,
         config.dataset_sample_ratios,
         seed=config.dataloader_sampler_seed,
@@ -501,7 +502,7 @@ def train(config: TrainingConfig):
         strict=True,
     ):
         accelerator.print(f"  {name}: {len(source_dataset)} frames, target sample ratio {sample_ratio:.1%}")
-    accelerator.print(f"Weighted sampler epoch length: {len(train_sampler)} samples")
+    accelerator.print(f"Weighted shuffle sampler epoch length: {len(train_sampler)} samples")
 
     with accelerator.main_process_first():
         policy_preprocessor = make_policy_processor(config, transformer_processor)
@@ -564,6 +565,7 @@ def train(config: TrainingConfig):
     logger.info(f"  Total optimization steps = {max_optim_steps}")
 
     completed_steps = training_state.completed_steps
+    accelerator.skip_first_batches(train_dataloader, completed_steps)
     progress_bar = tqdm(
         total=max_train_steps,
         initial=completed_steps,
