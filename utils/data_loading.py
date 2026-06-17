@@ -7,7 +7,7 @@ from collections.abc import Set
 from scipy.interpolate import CubicSpline
 import torch
 from torch.utils.data import Dataset, default_collate
-from typing import Any
+from typing import Any, Sequence
 import pathlib
 import numpy as np
 from lerobot.configs.types import NormalizationMode, PipelineFeatureType, PolicyFeature, FeatureType
@@ -566,7 +566,7 @@ def load_dataset(
     return ConcatDataset(preprocessed_subsets)
 
 def collate_with_observation_image_lists(
-    examples: Mapping[str, Any],
+    examples: Sequence[Mapping[str, Any]],
 ) -> Mapping[str, Any]:
     """
     Collate function that collates `observation.images.*` fields as lists rather than tensors.

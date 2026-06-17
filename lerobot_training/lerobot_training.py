@@ -67,11 +67,17 @@ class TrainingConfig:
     proprio_vocab_size: int = 256
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
-    # Number of image frames to input (5 past + 1 current = 6)
+    # Number of image frames to input (1 current frame, > 1 would load historical frames)
     num_frames: int = 1
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
     dataloader_sampler_seed: int = 42
 
+    def __post_init__(self):
+        if self.checkpoint_save_frequency % self.gradient_accumulation_steps != 0:
+            raise ValueError("checkpoint_save_frequency must be divisible by gradient_accumulation_steps")
+        
+        if self.logging_frequency % self.gradient_accumulation_steps != 0:
+            raise ValueError("logging_frequency must be divisible by gradient_accumulation_steps")
 
 @dataclass
 class TrainingState:
@@ -204,8 +210,6 @@ class NoraImageTransform:
 class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
     config: TrainingConfig 
     transformer_processor: Any 
-    action_token_min: int = -1
-    action_token_max: int = -1
 
     IMAGE_KEYS = (
         'observation.images.head',
@@ -223,11 +227,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         action_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(action_tokens)
         action_ids = [id for id in action_ids if id is not None and id != self.transformer_processor.tokenizer.unk_token_id]
         
-        if action_ids:
-            self.action_token_min = min(action_ids)
-            self.action_token_max = max(action_ids)
-        else:
-            raise ValueError("Action Tokens not found in the Gemma vocabulary!")
+        if len(action_ids) != self.config.action_vocab_size:
+            raise ValueError("Action tokens not found in the Gemma vocabulary!")
 
         proprio_tokens = make_proprio_state_tokens(self.config.proprio_vocab_size)
         proprio_ids = self.transformer_processor.tokenizer.convert_tokens_to_ids(proprio_tokens)
@@ -351,7 +352,7 @@ def make_policy_processor(config: TrainingConfig, transformer_processor: Any) ->
 
 # --- 3. Model Initialization ---
 def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
-    """Loads Gemma-4, its processor, injects action tokens, and applies embedding hotfix."""
+    """Loads Gemma-4, its processor, injects action tokens, and resizes embeddings."""
     with accelerator.main_process_first():
         transformer_processor = AutoProcessor.from_pretrained(
             config.model_id,
@@ -387,8 +388,9 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
         )
     
     # freeze audio components
-    model.model.audio_tower.requires_grad_(False)
-    model.model.embed_audio.requires_grad_(False)
+    if hasattr(model.model, 'audio_tower'):
+        model.model.audio_tower.requires_grad_(False)
+        model.model.embed_audio.requires_grad_(False)
 
     # Resize token embedding layers
     accelerator.print("Resizing token embedding layer.")
@@ -399,30 +401,6 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     if hasattr(model, 'config'):
         model.config.vocab_size = new_vocab_size
     accelerator.print("Done resizing token embedding layer.")
-
-    # =====================================================================
-    # [HOTFIX] Scan and force resize nested embedding layers missed by API
-    # =====================================================================
-    for name, module in model.named_modules():
-        if isinstance(module, torch.nn.Embedding) and module.num_embeddings == old_vocab_size:
-            accelerator.print(f"-> Hotfix: Resizing nested layer {name} from {old_vocab_size} to {new_vocab_size}")
-            
-            old_weight = module.weight.data
-            new_weight = torch.empty((new_vocab_size, module.embedding_dim), 
-                                     dtype=old_weight.dtype, 
-                                     device=old_weight.device)
-            new_weight[:old_vocab_size, :] = old_weight
-            
-            mean = old_weight.mean(dim=0)
-            std = old_weight.std(dim=0)
-            new_weight[old_vocab_size:, :] = torch.normal(
-                mean.expand(new_vocab_size - old_vocab_size, -1), 
-                std.expand(new_vocab_size - old_vocab_size, -1)
-            )
-            
-            module.num_embeddings = new_vocab_size
-            module.weight = torch.nn.Parameter(new_weight)
-    # =====================================================================
 
     if config.load_model_weights:
         tensors = {}
@@ -626,8 +604,8 @@ def train(config: TrainingConfig):
 
                     optimizer.zero_grad()
 
-            if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
-                accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
+                    if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
+                        accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
 
             if completed_steps >= max_train_steps:
                 break
