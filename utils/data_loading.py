@@ -254,6 +254,7 @@ class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
                 state_segments.append(self.convert(state_se3))
 
         new_transition['action'] = torch.cat(action_segments, dim = -1)
+        new_transition['observation'] = transition['observation'].copy()
         new_transition['observation'][self.state_key] = torch.cat(state_segments, dim = -1)
         return new_transition
     
