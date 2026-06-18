@@ -569,7 +569,7 @@ def train(config: TrainingConfig):
     logger.info(f"  Total optimization steps = {max_optim_steps}")
 
     completed_steps = training_state.completed_steps
-    accelerator.skip_first_batches(train_dataloader, completed_steps)
+    train_dataloader = accelerator.skip_first_batches(train_dataloader, completed_steps)
     progress_bar = tqdm(
         total=max_train_steps,
         initial=completed_steps,
