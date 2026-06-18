@@ -7,4 +7,4 @@ scipy
 pillow
 safetensors
 tqdm
-lerobot==0.5.1
+lerobot @ git+https://github.com/huggingface/lerobot.git@dfdc48a7f131c89ade51e322f5c11180b8509c72
