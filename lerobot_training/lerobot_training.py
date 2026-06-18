@@ -68,6 +68,8 @@ class TrainingConfig:
     proprio_vocab_size: int = 256
     # Gemma 4 image token budget
     max_tokens_per_image: int = 70
+    # Max total token length per sample; longer sequences are right-truncated
+    max_sequence_length: int = 500
     # Number of image frames to input (1 current frame, > 1 would load historical frames)
     num_frames: int = 1
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
@@ -313,6 +315,8 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
             text=text_prompts,
             images=batch_images,
             padding=True,
+            truncation=True,
+            max_length=self.config.max_sequence_length,
             return_tensors="pt",
         )
         
