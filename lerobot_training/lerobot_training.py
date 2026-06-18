@@ -41,6 +41,25 @@ from weighted_concat_shuffle_sampler import WeightedConcatShuffleSampler
 
 logger = get_logger(__name__)
 
+
+def install_subtask_complementary_key() -> None:
+    """Restore ``subtask`` forwarding in lerobot's batch->transition converter.
+
+    lerobot 0.5.1 forwarded a ``subtask`` key into ``complementary_data``. The language-support
+    refactor (PR #3467, in 0.5.2 / ``main``) replaced the explicit per-key handling with a fixed
+    ``_COMPLEMENTARY_KEYS`` allowlist that dropped ``subtask``, so our custom subtask field is
+    silently discarded by ``batch_to_transition`` and ``NoraPolicyProcessorStep`` then raises
+    ``KeyError: 'subtask'``. Re-add it so subtask round-trips exactly like ``task`` does. No-op on
+    versions without the allowlist (which already forward subtask). Must run before the dataloader
+    workers fork so they inherit the patch.
+    """
+    import lerobot.processor.converters as converters
+
+    keys = getattr(converters, "_COMPLEMENTARY_KEYS", None)
+    if keys is not None and "subtask" not in keys:
+        converters._COMPLEMENTARY_KEYS = (*keys, "subtask")
+
+
 # --- 1. Configuration ---
 @dataclass
 class TrainingConfig:
@@ -429,6 +448,10 @@ def train(config: TrainingConfig):
     # increase the number of open files limit to accommodate large datasets
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (65535, hard))
+
+    # lerobot >=0.5.2 stopped forwarding our custom `subtask` key through the batch->transition
+    # converter; re-add it before dataloader workers fork (otherwise: KeyError 'subtask').
+    install_subtask_complementary_key()
 
     # try to use faster float32 matmul
     torch.set_float32_matmul_precision('high')
