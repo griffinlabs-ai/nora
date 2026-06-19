@@ -74,6 +74,16 @@ class GriffinAlphaImageTransform:
         target_size = round(source_size[0] * linear_scale), round(source_size[1] * linear_scale)
         return T_v2.RandomCrop(target_size)
 
+    @staticmethod
+    @cache
+    def get_center_crop_transform(source_size: tuple[int, int], scale: float) -> T_v2.CenterCrop:
+        linear_scale = scale**0.5
+        target_size = round(source_size[0] * linear_scale), round(source_size[1] * linear_scale)
+        return T_v2.CenterCrop(target_size)
+
+    def center_crop(self, image: torch.Tensor) -> torch.Tensor:
+        return self.get_center_crop_transform(image.shape[-2:], self.CROP_SCALE)(image)
+
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
         image = self.get_random_crop_transform(image.shape[-2:], self.CROP_SCALE)(image)
         return self.color_jitter(image)
@@ -132,6 +142,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
     proprio_vocab_size: int = 256
     action_vocab_size: int = 2048
     apply_image_augmentation: bool = True
+    apply_inference_center_crop: bool = False
     image_keys: tuple[str, ...] = (
         "observation.images.head",
         "observation.images.hand_left",
@@ -200,6 +211,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
         action = transition.get(TransitionKey.ACTION)
         is_training = isinstance(action, torch.Tensor)
         apply_augmentation = self.apply_image_augmentation and is_training and torch.is_grad_enabled()
+        apply_center_crop = self.apply_inference_center_crop and not apply_augmentation
 
         text_prompts = []
         batch_images = []
@@ -212,6 +224,8 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
                 if img_tensor is not None:
                     if apply_augmentation:
                         img_tensor = self._image_transform(img_tensor)
+                    elif apply_center_crop:
+                        img_tensor = self._image_transform.center_crop(img_tensor)
                     imgs_for_this_sample.append(img_tensor)
 
             batch_images.append(imgs_for_this_sample)
@@ -315,6 +329,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
             "proprio_vocab_size": self.proprio_vocab_size,
             "action_vocab_size": self.action_vocab_size,
             "apply_image_augmentation": self.apply_image_augmentation,
+            "apply_inference_center_crop": self.apply_inference_center_crop,
             "image_keys": self.image_keys,
         }
     
@@ -328,6 +343,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
             proprio_vocab_size=config.proprio_vocab_size,
             action_vocab_size=config.action_vocab_size,
             apply_image_augmentation=config.apply_image_augmentation,
+            apply_inference_center_crop=config.apply_inference_center_crop,
             image_keys=config.image_keys,
         )
 
