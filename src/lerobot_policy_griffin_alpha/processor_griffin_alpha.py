@@ -209,8 +209,8 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
         complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA) or {}
         info = transition[TransitionKey.INFO]
         action = transition.get(TransitionKey.ACTION)
-        is_training = isinstance(action, torch.Tensor)
-        apply_augmentation = self.apply_image_augmentation and is_training and torch.is_grad_enabled()
+        has_action_labels = isinstance(action, torch.Tensor)
+        apply_augmentation = self.apply_image_augmentation and has_action_labels and torch.is_grad_enabled()
         apply_center_crop = self.apply_inference_center_crop and not apply_augmentation
 
         text_prompts = []
@@ -257,7 +257,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
                 }
             )
 
-            if is_training:
+            if has_action_labels:
                 sample_action = action[i][:, :n_action_dims]
                 fast_tokens = self._fast_tokenizer(sample_action.cpu())[0]
                 vlm_action = map_fast_token_to_vlm_action(fast_tokens)
@@ -295,7 +295,7 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
 
         batch_input["n_action_dims"] = info.get("n_action_dims")
 
-        if is_training:
+        if has_action_labels:
             labels = batch_input["input_ids"].clone()
             sot_token_id = self._vla_processor.tokenizer.sot_token_id
             for i in range(labels.size(0)):
