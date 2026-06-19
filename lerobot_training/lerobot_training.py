@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from datetime import timedelta
 from functools import lru_cache
 import sys
@@ -77,7 +81,7 @@ class TrainingConfig:
     egodex_root: str = "data/egodex/train"
     droid_root: str = "data/droid_1.0.1"
     wandb_project_name: str = "Griffin Alpha"
-    checkpoint_save_frequency: int = 20000
+    checkpoint_save_frequency: int = 1000
     logging_frequency: int = 100
     gradient_clipping: float = 50
     dataloader_num_workers: int = 8
@@ -631,11 +635,13 @@ def train(config: TrainingConfig):
                     optimizer.zero_grad()
 
                     if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
+                        torch.cuda.empty_cache()
                         accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
 
             if completed_steps >= max_train_steps:
                 break
 
+    torch.cuda.empty_cache()
     accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
     if accelerator.is_main_process:
         checkpoint_path = os.path.join(config.output_dir, f"steps_{completed_steps}")
