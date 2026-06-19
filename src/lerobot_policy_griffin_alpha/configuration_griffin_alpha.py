@@ -53,6 +53,7 @@ class GriffinAlphaConfig(PreTrainedConfig):
     fast_action_tokenizer_name: str = "lerobot/fast-action-tokenizer"
     base_vlm_processor_name: str = "google/gemma-4-E4B-it"
     apply_image_augmentation: bool = True
+    apply_inference_center_crop: bool = False
     gradient_checkpointing: bool = True
 
     image_keys: tuple[str, ...] = (
