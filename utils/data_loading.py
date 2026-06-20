@@ -549,6 +549,7 @@ def load_dataset(
                 str(task_root.relative_to(root)) if not root_is_task_root else root.name,
                 root=task_root,
                 delta_timestamps=delta_timestamps,
+                tolerance_s=1e-3,
             )
             task_config = load_task_config(task_root)
             subset_inst_transform = functools.partial(
