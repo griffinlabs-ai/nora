@@ -5,9 +5,12 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from datetime import timedelta
 from functools import lru_cache
 import sys
-import resource
 import pathlib
 from collections import defaultdict
+try:
+    import resource
+except ImportError:
+    resource = None
 
 from torch.utils.data.dataset import ConcatDataset
 from torch.distributed.fsdp import FSDPModule
@@ -95,6 +98,7 @@ class TrainingConfig:
     max_sequence_length: int = 500
     # Number of image frames to input (1 current frame, > 1 would load historical frames)
     num_frames: int = 1
+    enable_image_augmentation: bool = True
     dataset_sample_ratios: Tuple[float, float, float, float] = (0.70, 0.05, 0.05, 0.15)
     dataloader_sampler_seed: int = 42
 
@@ -210,7 +214,8 @@ class NoraImageTransform:
     HUE_FACTOR = 0.05
     CROP_SCALE = 0.9
 
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
         self.color_jitter = T_v2.ColorJitter(
             brightness=self.BRIGHTNESS_FACTOR,
             contrast=self.CONTRAST_FACTOR,
@@ -226,6 +231,8 @@ class NoraImageTransform:
         return T_v2.RandomCrop(target_size)
 
     def __call__(self, image: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return image
         image = self.get_random_crop_transform(image.shape[-2:], self.CROP_SCALE)(image)
         image = self.color_jitter(image)
         return image
@@ -265,7 +272,7 @@ class NoraPolicyProcessorStep(lerobot.processor.ProcessorStep):
         if len(proprio_ids) != self.config.proprio_vocab_size:
             raise ValueError("Proprio state tokens not found in the Gemma vocabulary!")
 
-        self.nora_image_transform = NoraImageTransform()
+        self.nora_image_transform = NoraImageTransform(self.config.enable_image_augmentation)
 
     def __call__(self, transition) -> lerobot.processor.EnvTransition:
         batch_size = transition['action'].shape[0]
@@ -450,8 +457,9 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
 def train(config: TrainingConfig):
     """Main training loop."""
     # increase the number of open files limit to accommodate large datasets
-    _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (65535, hard))
+    if resource is not None:
+        _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (65535, hard))
 
     # lerobot >=0.5.2 stopped forwarding our custom `subtask` key through the batch->transition
     # converter; re-add it before dataloader workers fork (otherwise: KeyError 'subtask').
