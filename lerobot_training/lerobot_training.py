@@ -541,7 +541,9 @@ def train(config: TrainingConfig):
     train_dataloader = DataLoader(
         dataset,
         batch_size=config.per_device_batch_size,
-        collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
+        collate_fn=lambda examples: policy_preprocessor(
+            collate_with_observation_image_lists([e for e in examples if e is not None])
+        ),
         sampler=train_sampler,
         num_workers=config.dataloader_num_workers,
         pin_memory=True,

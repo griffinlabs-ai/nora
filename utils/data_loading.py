@@ -2,6 +2,7 @@ import bisect
 from dataclasses import dataclass
 import functools
 import json
+import logging
 from typing import Callable, Generic, Iterable, Mapping
 from collections.abc import Set
 from scipy.interpolate import CubicSpline
@@ -19,6 +20,8 @@ from tqdm import tqdm
 
 from lerobot.processor.pipeline import PolicyProcessorPipeline, TOutput
 
+logger = logging.getLogger(__name__)
+
 class PreprocessedDataset(Dataset, Generic[TOutput]):
 
     def __init__(self, dataset: Dataset, preprocessor: PolicyProcessorPipeline[dict[str, Any], TOutput]):
@@ -26,7 +29,11 @@ class PreprocessedDataset(Dataset, Generic[TOutput]):
         self.preprocessor = preprocessor
 
     def __getitem__(self, index):
-        return self.preprocessor(self.dataset[index])
+        try:
+            return self.preprocessor(self.dataset[index])
+        except Exception as e:
+            logger.warning("Failed to load frame %s: %s", index, e, exc_info=True)
+            return None
 
     def __len__(self):
         return len(self.dataset)
