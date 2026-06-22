@@ -27,7 +27,7 @@ for _path in (_ROOT, _THIS_DIR):
         sys.path.insert(0, str(_path))
 
 import load_datasets
-from lerobot_training import TrainingConfig, make_policy_processor
+from lerobot_training import TrainingConfig, install_subtask_complementary_key, make_policy_processor
 from utils.data_loading import collate_with_observation_image_lists
 
 
@@ -49,6 +49,8 @@ class EvalConfig:
     output_dir: str = "./eval_results"
     run_name: str | None = None
     datasets: tuple[str, ...] = ("agibot_world", "galaxea", "interndata_a1", "droid")
+    split: str = "val"
+    val_fraction: float = 0.05
     per_device_batch_size: int = 4
     dataloader_num_workers: int = 0
     max_eval_samples: int | None = 2048
@@ -130,6 +132,8 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--output-dir", default=EvalConfig.output_dir)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--datasets", default=",".join(EvalConfig.datasets), help="Comma-separated dataset keys.")
+    parser.add_argument("--split", choices=("all", "train", "val"), default=EvalConfig.split)
+    parser.add_argument("--val-fraction", type=float, default=EvalConfig.val_fraction)
     parser.add_argument("--per-device-batch-size", type=int, default=EvalConfig.per_device_batch_size)
     parser.add_argument("--dataloader-num-workers", type=int, default=EvalConfig.dataloader_num_workers)
     parser.add_argument("--max-eval-samples", type=int, default=EvalConfig.max_eval_samples)
@@ -153,6 +157,8 @@ def parse_args() -> EvalConfig:
     args = parser.parse_args()
     cfg = EvalConfig(**vars(args))
     cfg.datasets = tuple(dataset.strip() for dataset in args.datasets.split(",") if dataset.strip())
+    if not 0 < cfg.val_fraction < 1:
+        raise ValueError(f"--val-fraction must be in (0, 1), got {cfg.val_fraction}")
     if cfg.max_eval_samples is not None and cfg.max_eval_samples <= 0:
         cfg.max_eval_samples = None
     return cfg
@@ -226,6 +232,25 @@ def sample_dataset(dataset: Dataset, max_samples: int | None, seed: int) -> Data
     return Subset(dataset, indices)
 
 
+def split_dataset(dataset: Dataset, split: str, val_fraction: float, seed: int) -> Dataset:
+    if split == "all":
+        return dataset
+
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    indices = torch.randperm(len(dataset), generator=generator).tolist()
+    val_count = max(1, int(round(len(indices) * val_fraction)))
+    if split == "val":
+        selected = indices[:val_count]
+    elif split == "train":
+        selected = indices[val_count:]
+    else:
+        raise ValueError(f"Unknown split: {split}")
+    if not selected:
+        raise ValueError(f"Split {split!r} is empty for dataset of length {len(dataset)}.")
+    return Subset(dataset, selected)
+
+
 def build_eval_dataset(cfg: EvalConfig) -> Dataset:
     unknown = sorted(set(cfg.datasets) - set(DATASET_LOADERS))
     if unknown:
@@ -241,6 +266,7 @@ def build_eval_dataset(cfg: EvalConfig) -> Dataset:
             num_frames=cfg.num_frames,
         )
         dataset = NamedDataset(dataset, display_name)
+        dataset = split_dataset(dataset, cfg.split, cfg.val_fraction, cfg.seed + dataset_idx)
         dataset = sample_dataset(dataset, cfg.max_samples_per_dataset, cfg.seed + dataset_idx)
         named_datasets.append(dataset)
 
@@ -267,6 +293,7 @@ def make_training_config(cfg: EvalConfig) -> TrainingConfig:
 
 def load_vlm_backend(cfg: EvalConfig, device: torch.device):
     training_cfg = make_training_config(cfg)
+    install_subtask_complementary_key()
     processor = AutoProcessor.from_pretrained(
         cfg.model_id,
         trust_remote_code=True,
@@ -301,8 +328,17 @@ def load_vlm_backend(cfg: EvalConfig, device: torch.device):
     model.to(device)
     model.eval()
     policy_preprocessor = make_policy_processor(training_cfg, processor)
-    action_token_ids = set(processor.tokenizer.convert_tokens_to_ids(action_tokens))
-    return model, policy_preprocessor, action_token_ids
+    action_token_ids = processor.tokenizer.convert_tokens_to_ids(action_tokens)
+    action_token_id_to_index = {
+        token_id: token_idx
+        for token_idx, token_id in enumerate(action_token_ids)
+        if token_id is not None and token_id != processor.tokenizer.unk_token_id
+    }
+    fast_tokenizer = AutoProcessor.from_pretrained(
+        "lerobot/fast-action-tokenizer",
+        trust_remote_code=True,
+    )
+    return model, policy_preprocessor, frozenset(action_token_id_to_index), action_token_id_to_index, fast_tokenizer
 
 
 def import_object(import_path: str):
@@ -353,6 +389,8 @@ def update_vlm_metrics(
     labels: torch.Tensor,
     logits: torch.Tensor,
     action_token_ids: set[int],
+    action_token_id_to_index: Mapping[int, int],
+    fast_tokenizer: Any,
 ) -> None:
     shift_logits = logits[:, :-1].float()
     shift_labels = labels[:, 1:]
@@ -385,8 +423,97 @@ def update_vlm_metrics(
         action_count = int(action_mask[sample_idx].sum().item())
         if action_count:
             acc.add("action_token_accuracy", float(action_correct[sample_idx].sum().item()), action_count)
+            predicted_action_token_ids = predictions[sample_idx][action_mask[sample_idx]].tolist()
+            target_action_token_ids = shift_labels[sample_idx][action_mask[sample_idx]].tolist()
+            valid_predicted_tokens = sum(
+                int(token_id) in action_token_id_to_index
+                for token_id in predicted_action_token_ids
+            )
+            acc.add("action_token_valid_rate", valid_predicted_tokens, action_count)
+            decoded_predicted = decode_fast_action_tokens(
+                predicted_action_token_ids,
+                action_token_id_to_index,
+                fast_tokenizer,
+            )
+            decoded_target = decode_fast_action_tokens(
+                target_action_token_ids,
+                action_token_id_to_index,
+                fast_tokenizer,
+            )
+            if decoded_predicted is not None and decoded_target is not None:
+                update_decoded_action_metrics(
+                    acc,
+                    raw_batch,
+                    sample_idx,
+                    decoded_predicted,
+                    decoded_target,
+                    metric_prefix="decoded_action",
+                )
         acc.add_raw("tokens", token_count)
         acc.add_raw("action_tokens", action_count)
+
+
+def decode_fast_action_tokens(
+    token_ids: Sequence[int],
+    action_token_id_to_index: Mapping[int, int],
+    fast_tokenizer: Any,
+) -> torch.Tensor | None:
+    try:
+        fast_tokens = [action_token_id_to_index[int(token_id)] for token_id in token_ids]
+    except KeyError:
+        return None
+    try:
+        decoded = fast_tokenizer.decode([fast_tokens])
+    except Exception:
+        return None
+    decoded_tensor = torch.as_tensor(decoded, dtype=torch.float32)
+    if decoded_tensor.ndim >= 3 and decoded_tensor.shape[0] == 1:
+        decoded_tensor = decoded_tensor[0]
+    return decoded_tensor
+
+
+def update_decoded_action_metrics(
+    accumulator: MetricAccumulator,
+    raw_batch: Mapping[str, Any],
+    sample_idx: int,
+    predicted_action: torch.Tensor,
+    target_action: torch.Tensor,
+    metric_prefix: str,
+) -> None:
+    raw_target = raw_batch["action"][sample_idx].float()
+    n_action_dims = raw_batch.get("info", {}).get("n_action_dims")
+    if n_action_dims is not None:
+        if torch.is_tensor(n_action_dims):
+            action_dim = int(n_action_dims[sample_idx].item())
+        else:
+            action_dim = int(n_action_dims[sample_idx])
+    else:
+        action_dim = raw_target.shape[-1]
+
+    horizon = min(predicted_action.shape[-2], target_action.shape[-2], raw_target.shape[-2])
+    action_dim = min(action_dim, predicted_action.shape[-1], target_action.shape[-1], raw_target.shape[-1])
+    if horizon <= 0 or action_dim <= 0:
+        return
+
+    predicted_action = predicted_action[:horizon, :action_dim]
+    target_action = target_action[:horizon, :action_dim]
+    raw_target = raw_target[:horizon, :action_dim]
+
+    pred_vs_raw = predicted_action - raw_target
+    pred_vs_decoded_target = predicted_action - target_action
+    n_values = horizon * action_dim
+    accumulator.add(f"{metric_prefix}_mae", float(pred_vs_raw.abs().sum().item()), n_values)
+    accumulator.add(f"{metric_prefix}_mse", float(pred_vs_raw.square().sum().item()), n_values)
+    accumulator.add(
+        f"{metric_prefix}_quantized_target_mae",
+        float(pred_vs_decoded_target.abs().sum().item()),
+        n_values,
+    )
+    accumulator.add(
+        f"{metric_prefix}_first_step_mae",
+        float(pred_vs_raw[0].abs().sum().item()),
+        action_dim,
+    )
 
 
 def update_policy_action_metrics(
@@ -449,7 +576,23 @@ def extract_action_tensor(output: Any) -> torch.Tensor | None:
         for key in ("action", "actions", "pred_action", "predicted_action"):
             if key in output:
                 return extract_action_tensor(output[key])
+    for key in ("action", "actions", "pred_action", "predicted_action"):
+        if hasattr(output, key):
+            return extract_action_tensor(getattr(output, key))
     return None
+
+
+def extract_loss_and_extra(output: Any) -> tuple[Any, Mapping[str, Any] | None]:
+    if isinstance(output, Mapping):
+        return output.get("loss"), {k: v for k, v in output.items() if k != "loss"}
+    if isinstance(output, tuple):
+        if len(output) == 2:
+            return output
+        if len(output) > 0:
+            return output[0], None
+    if hasattr(output, "loss"):
+        return getattr(output, "loss"), None
+    return output, None
 
 
 def merge_metrics(accumulators: dict[str, MetricAccumulator]) -> dict[str, Any]:
@@ -472,9 +615,30 @@ def merge_metrics(accumulators: dict[str, MetricAccumulator]) -> dict[str, Any]:
     return metrics
 
 
+def add_batch_scalar_metric(
+    accumulators: dict[str, MetricAccumulator],
+    raw_batch: Mapping[str, Any],
+    metric_name: str,
+    value: float,
+) -> None:
+    dataset_names = get_dataset_names(raw_batch)
+    unique_names = set(dataset_names)
+    if len(unique_names) == 1:
+        accumulators[dataset_names[0]].add(metric_name, value, len(dataset_names))
+    else:
+        accumulators["mixed_batch"].add(metric_name, value, len(dataset_names))
+        accumulators["mixed_batch"].add_raw(f"{metric_name}_mixed_batches", 1)
+
+
 @torch.inference_mode()
 def evaluate_vlm(cfg: EvalConfig, dataset: Dataset, device: torch.device) -> dict[str, Any]:
-    model, policy_preprocessor, action_token_ids = load_vlm_backend(cfg, device)
+    (
+        model,
+        policy_preprocessor,
+        action_token_ids,
+        action_token_id_to_index,
+        fast_tokenizer,
+    ) = load_vlm_backend(cfg, device)
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.per_device_batch_size,
@@ -495,6 +659,8 @@ def evaluate_vlm(cfg: EvalConfig, dataset: Dataset, device: torch.device) -> dic
             model_inputs["labels"],
             outputs.logits.detach(),
             action_token_ids,
+            action_token_id_to_index,
+            fast_tokenizer,
         )
     return merge_metrics(accumulators)
 
@@ -513,28 +679,26 @@ def evaluate_policy(cfg: EvalConfig, dataset: Dataset, device: torch.device) -> 
     accumulators: dict[str, MetricAccumulator] = defaultdict(MetricAccumulator)
     for raw_batch in tqdm(dataloader, desc="Evaluating policy"):
         device_batch = move_to_device(raw_batch, device)
+        output = None
         if hasattr(policy, "forward"):
             output = policy(device_batch)
-            if isinstance(output, Mapping):
-                loss = output.get("loss")
-                extra = {k: v for k, v in output.items() if k != "loss"}
-            elif isinstance(output, tuple):
-                loss, extra = output
-            else:
-                loss, extra = output, None
+            loss, extra = extract_loss_and_extra(output)
             if torch.is_tensor(loss):
-                for dataset_name in get_dataset_names(raw_batch):
-                    accumulators[dataset_name].add("policy_loss", float(loss.detach().float().item()))
+                add_batch_scalar_metric(
+                    accumulators,
+                    raw_batch,
+                    "policy_loss",
+                    float(loss.detach().float().item()),
+                )
             if isinstance(extra, Mapping):
                 for key, value in extra.items():
                     if isinstance(value, (int, float)):
-                        for dataset_name in get_dataset_names(raw_batch):
-                            accumulators[dataset_name].add(str(key), float(value))
+                        add_batch_scalar_metric(accumulators, raw_batch, str(key), float(value))
 
-        predicted_action = None
+        predicted_action = extract_action_tensor(output)
         if hasattr(policy, "predict_action_chunk"):
             predicted_action = policy.predict_action_chunk(device_batch)
-        elif hasattr(policy, "select_action"):
+        elif predicted_action is None and hasattr(policy, "select_action"):
             predicted_action = policy.select_action(device_batch)
         predicted_action = extract_action_tensor(predicted_action)
         if predicted_action is not None:

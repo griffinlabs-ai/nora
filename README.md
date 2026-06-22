@@ -145,6 +145,8 @@ python lerobot_training/evaluate_lerobot.py \
   --model-id google/gemma-4-E4B-it \
   --load-model-weights /path/to/model.safetensors \
   --datasets agibot_world,galaxea,interndata_a1,droid \
+  --split val \
+  --val-fraction 0.05 \
   --max-samples-per-dataset 500 \
   --output-dir eval_results \
   --run-name nora_eval
@@ -163,7 +165,8 @@ python lerobot_training/evaluate_lerobot.py \
 
 The script reports deterministic held-out imitation metrics commonly used before rollout
 experiments: loss/perplexity, response token accuracy, action token accuracy, action MAE/MSE,
-first-step action MAE, and per-dataset breakdowns. Results are saved as both JSON and CSV.
+first-step action MAE, decoded VLM action MAE/MSE, action-token validity, and per-dataset
+breakdowns. Results are saved as both JSON and CSV.
 
 ## Acknowledgement
 This repository is built based on [OpenVLA](https://github.com/openvla/openvla), [Open X-Embodiment](https://github.com/google-deepmind/open_x_embodiment?tab=readme-ov-file),[transformers](https://github.com/huggingface/transformers), [accelerate](https://github.com/huggingface/accelerate), [Qwen2.5 VL](https://github.com/QwenLM/Qwen2.5-VL). Thanks!
