@@ -605,6 +605,16 @@ def train(config: TrainingConfig):
         model, optimizer, train_dataloader
     )
 
+    # Re-tie embed_tokens <-> lm_head after FSDP2 sharding. accelerate only re-ties
+    # automatically when ``cpu_ram_efficient_loading=True``; otherwise ``fully_shard`` registers
+    # ``lm_head.weight`` as a separate sharded param, breaking the tie. Because the optimizer was
+    # built from the (then-tied) params before ``prepare``, that fresh ``lm_head`` shard is also
+    # orphaned from the optimizer, so the action/proprio OUTPUT rows never receive an update and
+    # action-token loss stays pinned near ln(vocab). ``tie_weights`` points ``lm_head.weight`` back
+    # at the embed_tokens DTensor that IS optimized, restoring a single trainable embedding that
+    # the forward uses (verified: forward-time output weight trains, |embed - lm_head| stays 0).
+    accelerator.unwrap_model(model).tie_weights()
+
     n_units = sum(1 for m in model.modules() if isinstance(m, FSDPModule))
     accelerator.print(f"FSDP units: {n_units}")
 
@@ -631,6 +641,9 @@ def train(config: TrainingConfig):
         accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
         accelerator.load_state(config.resume_from_checkpoint)
         accelerator.print(f"Resumed from local checkpoint.")
+        # Loading a full/sharded state dict re-breaks the embed_tokens <-> lm_head tie (accelerate
+        # flags the same in fsdp_utils). Re-tie so the resumed run keeps training the output rows.
+        accelerator.unwrap_model(model).tie_weights()
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -708,6 +721,11 @@ def train(config: TrainingConfig):
 
                     if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                         torch.cuda.empty_cache()
+                        # Re-tie right before saving: state_dict serializes the module attr
+                        # ``lm_head.weight``, so this guarantees the checkpoint's lm_head IS the
+                        # trained embed (verified byte-identical on disk), independent of any
+                        # earlier untie (e.g. a prior resume). Cheap insurance.
+                        accelerator.unwrap_model(model).tie_weights()
                         accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
 
             if completed_steps >= max_train_steps:
