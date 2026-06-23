@@ -83,7 +83,7 @@ class TrainingConfig:
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 1000
     logging_frequency: int = 100
-    gradient_clipping: float = 200
+    gradient_clipping: float = float('inf')
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
@@ -611,8 +611,8 @@ def train(config: TrainingConfig):
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
-        num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps * accelerator.num_processes),
-        num_training_steps=max_optim_steps * accelerator.num_processes
+        num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps),
+        num_training_steps=max_optim_steps
     )
 
     lr_scheduler = accelerator.prepare(lr_scheduler)
