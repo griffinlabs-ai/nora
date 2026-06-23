@@ -81,8 +81,10 @@ class NamedDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
+    def __getitem__(self, index: int) -> dict[str, Any] | None:
         item = self.dataset[index]
+        if item is None:
+            return None
         item = dict(item)
         info = dict(item.get("info") or {})
         info["eval_dataset_name"] = self.name

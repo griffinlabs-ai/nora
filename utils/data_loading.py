@@ -575,13 +575,17 @@ def load_dataset(
     return ConcatDataset(preprocessed_subsets)
 
 def collate_with_observation_image_lists(
-    examples: Sequence[Mapping[str, Any]],
+    examples: Sequence[Mapping[str, Any] | None],
 ) -> Mapping[str, Any]:
     """
     Collate function that collates `observation.images.*` fields as lists rather than tensors.
 
     This allows for heterogeneous image shapes in the batch.
     """
+    examples = [example for example in examples if example is not None]
+    if not examples:
+        raise RuntimeError("All samples in the batch failed to load.")
+
     images = [
         {k: v for k, v in example.items() if k.startswith('observation.images.')}
         for example in examples
