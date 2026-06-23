@@ -15,6 +15,7 @@ except ImportError:
 from torch.utils.data.dataset import ConcatDataset
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
+from torch.nn.utils import get_total_norm
 
 _root = pathlib.Path(__file__).resolve().parent.parent  # repo root
 if str(_root) not in sys.path:
@@ -27,6 +28,7 @@ from typing import Iterator, List, Any, Optional, Sequence, Tuple
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 import torchvision.transforms as T_v2
 
@@ -86,7 +88,7 @@ class TrainingConfig:
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 1000
     logging_frequency: int = 100
-    gradient_clipping: float = 50
+    gradient_clipping: float = 200
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
@@ -453,6 +455,41 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
     return model, transformer_processor
 
 
+def _grad_norm_group(name: str) -> str:
+    """Bucket a parameter into a grad-norm group.
+
+    ``embed_tokens_per_layer`` is the Gemma4-specific per-layer embedding table and must be
+    checked before ``embed_tokens`` since the latter is a substring of the former.
+    """
+    if "embed_tokens_per_layer" in name:
+        return "per_layer_embed"
+    if "embed_tokens" in name:
+        return "text_embed"
+    return "other"
+
+
+def grouped_grad_norms(model) -> dict[str, float]:
+    """Per-group L2 grad norms (text embedding, per-layer embedding, other weights).
+
+    Must be called on every rank: ``get_total_norm`` reduces over sharded DTensor grads, so
+    skipping ranks would deadlock. Call before ``optimizer.zero_grad()`` while grads still exist.
+    """
+    groups: dict[str, list] = {"text_embed": [], "per_layer_embed": [], "other": []}
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            groups[_grad_norm_group(name)].append(p.grad)
+
+    norms = {}
+    for key, grads in groups.items():
+        if not grads:
+            continue
+        norm = get_total_norm(grads, norm_type=2.0)
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        norms[f"grad_norm/{key}"] = norm.item()
+    return norms
+
+
 # --- 4. Training Loop ---
 def train(config: TrainingConfig):
     """Main training loop."""
@@ -505,6 +542,13 @@ def train(config: TrainingConfig):
 
     model, transformer_processor = load_model_and_processor(config, accelerator)
 
+    # Boundary between original Gemma-4 vocabulary and the injected action/proprio tokens.
+    # Added tokens occupy the top of the vocabulary, so any label id >= this threshold is an
+    # injected token and anything below is an original VLM token.
+    added_token_start_id = len(transformer_processor.tokenizer) - (
+        config.action_vocab_size + config.proprio_vocab_size
+    )
+
     agibot_world = load_datasets.load_agibot_world_dataset(
         root = config.agibot_world_root,
         canonical_action_chunk_size = config.action_chunk_size,
@@ -549,7 +593,9 @@ def train(config: TrainingConfig):
     train_dataloader = DataLoader(
         dataset,
         batch_size=config.per_device_batch_size,
-        collate_fn=lambda examples: policy_preprocessor(collate_with_observation_image_lists(examples)),
+        collate_fn=lambda examples: policy_preprocessor(
+            collate_with_observation_image_lists([e for e in examples if e is not None])
+        ),
         sampler=train_sampler,
         num_workers=config.dataloader_num_workers,
         pin_memory=True,
@@ -566,6 +612,16 @@ def train(config: TrainingConfig):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+
+    # Re-tie embed_tokens <-> lm_head after FSDP2 sharding. accelerate only re-ties
+    # automatically when ``cpu_ram_efficient_loading=True``; otherwise ``fully_shard`` registers
+    # ``lm_head.weight`` as a separate sharded param, breaking the tie. Because the optimizer was
+    # built from the (then-tied) params before ``prepare``, that fresh ``lm_head`` shard is also
+    # orphaned from the optimizer, so the action/proprio OUTPUT rows never receive an update and
+    # action-token loss stays pinned near ln(vocab). ``tie_weights`` points ``lm_head.weight`` back
+    # at the embed_tokens DTensor that IS optimized, restoring a single trainable embedding that
+    # the forward uses (verified: forward-time output weight trains, |embed - lm_head| stays 0).
+    accelerator.unwrap_model(model).tie_weights()
 
     n_units = sum(1 for m in model.modules() if isinstance(m, FSDPModule))
     accelerator.print(f"FSDP units: {n_units}")
@@ -593,6 +649,9 @@ def train(config: TrainingConfig):
         accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
         accelerator.load_state(config.resume_from_checkpoint)
         accelerator.print(f"Resumed from local checkpoint.")
+        # Loading a full/sharded state dict re-breaks the embed_tokens <-> lm_head tie (accelerate
+        # flags the same in fsdp_utils). Re-tie so the resumed run keeps training the output rows.
+        accelerator.unwrap_model(model).tie_weights()
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -626,6 +685,10 @@ def train(config: TrainingConfig):
                 if accelerator.sync_gradients:
                     should_log = completed_steps % config.logging_frequency == 0
 
+                    # Compute per-group grad norms before clipping (all ranks must participate
+                    # since the reduction runs over sharded DTensor grads).
+                    group_grad_norms = grouped_grad_norms(model) if should_log else {}
+
                     if config.gradient_clipping != float('inf') or should_log:
                         grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
                         if isinstance(grad_norm, DTensor):
@@ -637,13 +700,40 @@ def train(config: TrainingConfig):
 
                     if should_log and accelerator.is_main_process:
                         lr = lr_scheduler.get_last_lr()[0]
+
+                        # Diagnostic only: split the per-token cross-entropy into the injected
+                        # action/proprio tokens vs the original Gemma-4 vocabulary tokens. This
+                        # mirrors the model's internal mean cross-entropy (reduction="none" then
+                        # mean over each group's valid tokens partitions the same loss). Computed
+                        # on the main-process micro-batch only, consistent with loss.item() above.
+                        with torch.no_grad():
+                            shift_logits = outputs.logits[:, :-1, :].float()
+                            shift_labels = batch["labels"][:, 1:]
+                            per_tok = F.cross_entropy(
+                                shift_logits.reshape(-1, shift_logits.size(-1)),
+                                shift_labels.reshape(-1),
+                                ignore_index=-100,
+                                reduction="none",
+                            )
+                            flat_labels = shift_labels.reshape(-1)
+                            valid = flat_labels != -100
+                            is_added = valid & (flat_labels >= added_token_start_id)
+                            is_text = valid & (flat_labels < added_token_start_id)
+                            action_loss = per_tok[is_added].mean().item() if is_added.any() else float("nan")
+                            text_loss = per_tok[is_text].mean().item() if is_text.any() else float("nan")
+
                         logger.info(f"Step {completed_steps}, Loss: {loss.item()}, Grad Norm: {grad_norm}", main_process_only=True)
-                        accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm": grad_norm}, step=completed_steps)
+                        accelerator.log({"train_loss": loss.item(), "learning_rate": lr,"grad_norm": grad_norm, "loss/action_tokens": action_loss, "loss/text_tokens": text_loss, **group_grad_norms}, step=completed_steps)
 
                     optimizer.zero_grad()
 
                     if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                         torch.cuda.empty_cache()
+                        # Re-tie right before saving: state_dict serializes the module attr
+                        # ``lm_head.weight``, so this guarantees the checkpoint's lm_head IS the
+                        # trained embed (verified byte-identical on disk), independent of any
+                        # earlier untie (e.g. a prior resume). Cheap insurance.
+                        accelerator.unwrap_model(model).tie_weights()
                         accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
 
             if completed_steps >= max_train_steps:
