@@ -10,8 +10,6 @@ import pathlib
 from collections import defaultdict
 
 from torch.utils.data.dataset import ConcatDataset
-from torch.distributed.fsdp import FSDPModule
-from torch.distributed.tensor import DTensor
 from torch.nn.utils import get_total_norm
 
 _root = pathlib.Path(__file__).resolve().parent.parent  # repo root
@@ -29,8 +27,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Sampler
 import torchvision.transforms as T_v2
 
-from accelerate import Accelerator, InitProcessGroupKwargs, DistributedDataParallelKwargs
-from accelerate.utils import TorchDynamoPlugin, FullyShardedDataParallelPlugin
+from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate.utils import DeepSpeedPlugin, TorchDynamoPlugin
 from accelerate.logging import get_logger
 
 # Use dynamic import to support different transformers versions for VLM base classes
@@ -85,7 +83,7 @@ class TrainingConfig:
     wandb_project_name: str = "Griffin Alpha"
     checkpoint_save_frequency: int = 1000
     logging_frequency: int = 100
-    gradient_clipping: float = 200
+    gradient_clipping: float = float('inf')
     dataloader_num_workers: int = 8
     action_chunk_size: int = 50
     model_id: str = "google/gemma-4-E4B-it"
@@ -464,8 +462,7 @@ def _grad_norm_group(name: str) -> str:
 def grouped_grad_norms(model) -> dict[str, float]:
     """Per-group L2 grad norms (text embedding, per-layer embedding, other weights).
 
-    Must be called on every rank: ``get_total_norm`` reduces over sharded DTensor grads, so
-    skipping ranks would deadlock. Call before ``optimizer.zero_grad()`` while grads still exist.
+    Call before ``optimizer.zero_grad()`` while grads still exist.
     """
     groups: dict[str, list] = {"text_embed": [], "per_layer_embed": [], "other": []}
     for name, p in model.named_parameters():
@@ -477,10 +474,14 @@ def grouped_grad_norms(model) -> dict[str, float]:
         if not grads:
             continue
         norm = get_total_norm(grads, norm_type=2.0)
-        if isinstance(norm, DTensor):
-            norm = norm.full_tensor()
-        norms[f"grad_norm/{key}"] = norm.item()
+        norms[f"grad_norm/{key}"] = scalar_value(norm)
     return norms
+
+
+def scalar_value(value) -> float:
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().item()
+    return float(value)
 
 
 # --- 4. Training Loop ---
@@ -503,28 +504,21 @@ def train(config: TrainingConfig):
         fullgraph=False,
         dynamic=False
     )
-    fsdp_plugin = FullyShardedDataParallelPlugin(
-        fsdp_version = 2,
-        reshard_after_forward=False,
-        auto_wrap_policy="transformer_based_wrap",
-        state_dict_type="SHARDED_STATE_DICT",
-        transformer_cls_names_to_wrap=[
-            "Gemma4TextModel",
-            "Gemma4TextScaledWordEmbedding",
-            "Gemma4VisionEncoderLayer",
-            "Gemma4AudioLayer",
-        ]
+    deepspeed_plugin = DeepSpeedPlugin(
+        zero_stage=2,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        gradient_clipping=config.gradient_clipping,
+        offload_optimizer_device="none",
+        offload_param_device="none",
     )
     accelerator = Accelerator(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         mixed_precision="bf16",
         log_with="wandb",
         dynamo_plugin=dynamo_plugin,
-        fsdp_plugin=fsdp_plugin,
+        deepspeed_plugin=deepspeed_plugin,
         kwargs_handlers=[
             InitProcessGroupKwargs(timeout=timedelta(seconds=1800)),
-            ## If switching to DDP:
-            # DistributedDataParallelKwargs(find_unused_parameters=True),
         ],
     )
     accelerator.dataloader_config.dispatch_batches = False
@@ -605,31 +599,19 @@ def train(config: TrainingConfig):
         model, optimizer, train_dataloader
     )
 
-    # Re-tie embed_tokens <-> lm_head after FSDP2 sharding. accelerate only re-ties
-    # automatically when ``cpu_ram_efficient_loading=True``; otherwise ``fully_shard`` registers
-    # ``lm_head.weight`` as a separate sharded param, breaking the tie. Because the optimizer was
-    # built from the (then-tied) params before ``prepare``, that fresh ``lm_head`` shard is also
-    # orphaned from the optimizer, so the action/proprio OUTPUT rows never receive an update and
-    # action-token loss stays pinned near ln(vocab). ``tie_weights`` points ``lm_head.weight`` back
-    # at the embed_tokens DTensor that IS optimized, restoring a single trainable embedding that
-    # the forward uses (verified: forward-time output weight trains, |embed - lm_head| stays 0).
-    accelerator.unwrap_model(model).tie_weights()
-
-    n_units = sum(1 for m in model.modules() if isinstance(m, FSDPModule))
-    accelerator.print(f"FSDP units: {n_units}")
-
-    # Per-rank local parameter count (DTensor .to_local() gives the shard)
-    local = sum(p.to_local().numel() if isinstance(p, DTensor) else p.numel()
-                for p in model.parameters())
-    accelerator.print(f"Local params on rank {accelerator.process_index}: {local/1e9:.2f}B")
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    accelerator.print(
+        f"Trainable params: {trainable_params/1e9:.2f}B / {total_params/1e9:.2f}B total"
+    )
 
     max_train_steps = math.floor(len(train_dataloader) * config.max_epochs)
     max_optim_steps = math.floor(math.ceil(len(train_dataloader) / config.gradient_accumulation_steps) * config.max_epochs)
     lr_scheduler = get_scheduler(
         name="cosine",
         optimizer=optimizer,
-        num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps * accelerator.num_processes),
-        num_training_steps=max_optim_steps * accelerator.num_processes
+        num_warmup_steps=math.ceil(config.num_warmup_steps / config.gradient_accumulation_steps),
+        num_training_steps=max_optim_steps
     )
 
     lr_scheduler = accelerator.prepare(lr_scheduler)
@@ -641,9 +623,6 @@ def train(config: TrainingConfig):
         accelerator.print(f"Resuming from local checkpoint: {config.resume_from_checkpoint}...")
         accelerator.load_state(config.resume_from_checkpoint)
         accelerator.print(f"Resumed from local checkpoint.")
-        # Loading a full/sharded state dict re-breaks the embed_tokens <-> lm_head tie (accelerate
-        # flags the same in fsdp_utils). Re-tie so the resumed run keeps training the output rows.
-        accelerator.unwrap_model(model).tie_weights()
 
     total_batch_size = config.per_device_batch_size * accelerator.num_processes * config.gradient_accumulation_steps
     logger.info("***** Running training *****")
@@ -677,15 +656,12 @@ def train(config: TrainingConfig):
                 if accelerator.sync_gradients:
                     should_log = completed_steps % config.logging_frequency == 0
 
-                    # Compute per-group grad norms before clipping (all ranks must participate
-                    # since the reduction runs over sharded DTensor grads).
+                    # Compute per-group grad norms before clipping while grads still exist.
                     group_grad_norms = grouped_grad_norms(model) if should_log else {}
 
                     if config.gradient_clipping != float('inf') or should_log:
                         grad_norm = accelerator.clip_grad_norm_(model.parameters(), config.gradient_clipping)
-                        if isinstance(grad_norm, DTensor):
-                            grad_norm = grad_norm.full_tensor()
-                        grad_norm = grad_norm.item()
+                        grad_norm = scalar_value(grad_norm)
 
                     optimizer.step()
                     lr_scheduler.step()
@@ -721,11 +697,6 @@ def train(config: TrainingConfig):
 
                     if completed_steps % config.checkpoint_save_frequency == 0 and completed_steps > 0:
                         torch.cuda.empty_cache()
-                        # Re-tie right before saving: state_dict serializes the module attr
-                        # ``lm_head.weight``, so this guarantees the checkpoint's lm_head IS the
-                        # trained embed (verified byte-identical on disk), independent of any
-                        # earlier untie (e.g. a prior resume). Cheap insurance.
-                        accelerator.unwrap_model(model).tie_weights()
                         accelerator.save_state(os.path.join(config.output_dir, f"steps_{completed_steps}"))
 
             if completed_steps >= max_train_steps:

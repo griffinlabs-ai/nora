@@ -1,6 +1,7 @@
 transformers>=5.5
 torchvision
 accelerate
+deepspeed
 wandb
 wheel
 scipy
