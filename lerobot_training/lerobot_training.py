@@ -439,7 +439,6 @@ def load_model_and_processor(config: TrainingConfig, accelerator: Accelerator):
         model.load_state_dict(tensors, strict=False)
         accelerator.print("Pretrained weights loaded.")
 
-    model.tie_weights()
     model.train()
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
