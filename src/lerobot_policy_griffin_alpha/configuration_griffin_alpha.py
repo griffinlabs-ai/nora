@@ -69,6 +69,10 @@ class GriffinAlphaConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.QUANTILES,
         }
     )
+    relative_action_mask: list[bool] | None = None
+    se3_segment_start_idxs: list[int] | None = None
+    resample_action_to_horizon: bool = False
+    state_key: str = OBS_STATE
 
     optimizer_lr: float = 3e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)

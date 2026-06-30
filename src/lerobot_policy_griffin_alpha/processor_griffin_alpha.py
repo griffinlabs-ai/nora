@@ -1,15 +1,19 @@
 from dataclasses import dataclass
 from functools import cache
 from typing import TypeVar
+from collections.abc import Set
 
+import numpy as np
 import torch
 import torchvision.transforms as T_v2
+from scipy.interpolate import CubicSpline
 from transformers import AutoProcessor
 
 import lerobot.processor
-from lerobot.configs.types import PipelineFeatureType
+from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
     DeviceProcessorStep,
+    NormalizerProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
     ProcessorStep,
@@ -130,6 +134,230 @@ class GriffinAlphaAddBatchDimensionProcessorStep(ProcessorStep):
 
     def transform_features(self, features):
         return features
+
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("griffinlabs/resample_action_processor")
+class ResampleActionProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Resample the action tensor from any chunk size to a target chunk size,
+    by cubic spline interpolation.
+
+    Args:
+     - target_chunk_size: The target chunk size to resample the action tensor to.
+     - state_key: Key for the state tensor that corresponds to the action tensor.
+       If None, the initial state is assumed to be zero.
+       Leave as None if the action tensor is in delta space.
+    """
+
+    target_chunk_size: int
+    state_key: str | None = None
+
+    def __call__(self, transition):
+        action = transition.get("action")
+        if action is None:
+            return transition
+
+        if self.state_key is not None:
+            initial_state = transition["observation"][self.state_key].unsqueeze(-2)
+        else:
+            initial_state = torch.zeros_like(action[..., :1, :])
+        orig_chunk_size = action.shape[-2]
+
+        if orig_chunk_size == self.target_chunk_size:
+            return transition
+
+        new_transition = transition.copy()
+
+        if orig_chunk_size % self.target_chunk_size == 0:
+            # If the original chunk size is a multiple of the target chunk size,
+            # we can simply take every n-th action.
+            step_size = orig_chunk_size // self.target_chunk_size
+            new_transition["action"] = action[..., step_size - 1 :: step_size, :]
+            return new_transition
+
+        new_transition["action"] = self._interpolate(action, initial_state, orig_chunk_size)
+        return new_transition
+
+    def _interpolate(self, action, initial_state, orig_chunk_size):
+        trajectory = torch.cat([initial_state, action], dim=-2)
+        old_times = np.linspace(0, 1, orig_chunk_size + 1)
+        new_times = np.linspace(1 / self.target_chunk_size, 1, self.target_chunk_size)
+
+        traj_np = trajectory.cpu().numpy()
+        cs = CubicSpline(old_times, traj_np, axis=-2)
+        resampled = cs(new_times)
+
+        return torch.from_numpy(resampled).to(dtype=action.dtype, device=action.device)
+
+    def transform_features(self, features):
+        original_shape = features["action"]["action"].shape
+        features["action"]["action"] = PolicyFeature(
+            FeatureType.ACTION,
+            (self.target_chunk_size, original_shape[-1]),
+        )
+        return features
+
+    def get_config(self):
+        return {
+            "target_chunk_size": self.target_chunk_size,
+            "state_key": self.state_key,
+        }
+
+
+@dataclass
+class EmbeddedSE3Segmenter:
+    se3_segment_start_idxs: Set[int] | list[int] | None = None
+
+    def __post_init__(self):
+        split_points = []
+        for start_idx in sorted(self.se3_segment_start_idxs or set()):
+            split_points.append((start_idx, "se3_matrix"))
+            split_points.append((start_idx + 16, "real"))
+        if len(split_points) == 0 or split_points[0][0] != 0:
+            split_points.insert(0, (None, "real"))
+        self.slices = [
+            (
+                slice(
+                    split_points[i][0],
+                    split_points[i + 1][0] if i + 1 < len(split_points) else None,
+                ),
+                split_points[i][1],
+            )
+            for i in range(len(split_points))
+        ]
+
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("griffinlabs/relative_action_with_se3_processor")
+class RelativeActionWithSE3ProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Convert action tensor from absolute space to relative space.
+    Expects an action shape of [..., chunk_size, degrees_of_freedom].
+    Expects transition to have a state tensor in the same vector space as the action tensor.
+
+    Args:
+     - mask: Mask of which action tensor dimensions to convert to relative space.
+       `True` dimensions output relative space, `False` dimensions keep absolute space.
+     - se3_segment_start_idxs: Indices of the action tensor dimensions that correspond to SE(3) matrices.
+       If None, all action tensor dimensions are assumed to be real.
+     - state_key: Key for the state tensor that corresponds to the action tensor.
+    """
+
+    mask: list[bool]
+    se3_segment_start_idxs: list[int] | None = None
+    state_key: str = OBS_STATE
+
+    def __post_init__(self):
+        self._mask = torch.tensor(self.mask, dtype=torch.bool)
+        self._segmenter = EmbeddedSE3Segmenter(self.se3_segment_start_idxs)
+
+    def __call__(self, transition):
+        action = transition.get("action")
+        if action is None:
+            return transition
+
+        new_transition = transition.copy()
+
+        state = transition["observation"][self.state_key].unsqueeze(-2)
+        leading_dims = action.shape[:-1]
+
+        assert self._mask.shape[-1] == action.shape[-1]
+
+        segments = []
+
+        for segment_slice, operand_type in self._segmenter.slices:
+            if operand_type == "real":
+                segment = action[..., segment_slice] - state[..., segment_slice]
+            elif operand_type == "se3_matrix":
+                action_se3 = action[..., segment_slice].view(*leading_dims, 4, 4)
+                state_se3 = state[..., segment_slice].view(*leading_dims[:-1], 1, 4, 4)
+                segment = state_se3.inverse().matmul(action_se3)
+                segment = segment.view(*leading_dims, 16)
+            segments.append(segment)
+
+        deltas = torch.cat(segments, dim=-1)
+        new_transition["action"] = torch.where(self._mask.expand(action.shape), deltas, action)
+        return new_transition
+
+    def transform_features(self, features):
+        return features
+
+    def get_config(self):
+        return {
+            "mask": self.mask,
+            "se3_segment_start_idxs": self.se3_segment_start_idxs,
+            "state_key": self.state_key,
+        }
+
+
+@dataclass
+@lerobot.processor.ProcessorStepRegistry.register("griffinlabs/se3_mat_to_xyz_rot6d_processor")
+class SE3MatrixToXYZRot6DProcessorStep(lerobot.processor.ProcessorStep):
+    """
+    Convert SE(3) matrices in the action tensor to XYZ and rot6d.
+    """
+
+    se3_segment_start_idxs: list[int]
+    state_key: str = OBS_STATE
+
+    PER_SE3_MATRIX_DIM_REDUCTION = 7    # 16 dimensions -> 9 dimensions
+
+    def __post_init__(self):
+        self._segmenter = EmbeddedSE3Segmenter(self.se3_segment_start_idxs)
+
+    @staticmethod
+    def convert(action: torch.Tensor) -> torch.Tensor:
+        return torch.cat(
+            [action[..., :3, 3], action[..., :3, :2].flatten(start_dim=-2)],
+            dim=-1,
+        )
+
+    def __call__(self, transition):
+        new_transition = transition.copy()
+        action = transition.get("action")
+        state = transition["observation"][self.state_key]
+
+        action_segments = []
+        state_segments = []
+
+        for segment_slice, operand_type in self._segmenter.slices:
+            if operand_type == "real":
+                if action is not None:
+                    action_segments.append(action[..., segment_slice])
+                state_segments.append(state[..., segment_slice])
+            elif operand_type == "se3_matrix":
+                if action is not None:
+                    action_se3 = action[..., segment_slice].view(*action.shape[:-1], 4, 4)
+                    action_segments.append(self.convert(action_se3))
+                state_se3 = state[..., segment_slice].view(*state.shape[:-1], 4, 4)
+                state_segments.append(self.convert(state_se3))
+
+        if action is not None:
+            new_transition["action"] = torch.cat(action_segments, dim=-1)
+        new_transition["observation"] = transition["observation"].copy()
+        new_transition["observation"][self.state_key] = torch.cat(state_segments, dim=-1)
+        return new_transition
+
+    def transform_features(self, features):
+        old_shape = features[PipelineFeatureType.ACTION]["action"].shape
+        num_se3_segments = sum(1 for _, t in self._segmenter.slices if t == "se3_matrix")
+        features[PipelineFeatureType.ACTION]["action"] = PolicyFeature(
+            FeatureType.ACTION,
+            old_shape[:-1] + (old_shape[-1] - num_se3_segments * self.PER_SE3_MATRIX_DIM_REDUCTION,),
+        )
+        old_shape = features[PipelineFeatureType.OBSERVATION][self.state_key].shape
+        features[PipelineFeatureType.OBSERVATION][self.state_key] = PolicyFeature(
+            FeatureType.STATE,
+            old_shape[:-1] + (old_shape[-1] - num_se3_segments * self.PER_SE3_MATRIX_DIM_REDUCTION,),
+        )
+        return features
+
+    def get_config(self):
+        return {
+            "se3_segment_start_idxs": self.se3_segment_start_idxs,
+            "state_key": self.state_key,
+        }
 
 
 @dataclass
@@ -354,12 +582,58 @@ def make_griffin_alpha_pre_post_processors(
     PolicyProcessorPipeline[EnvTransition, EnvTransition],
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
+    if config.se3_segment_start_idxs and config.resample_action_to_horizon:
+        raise ValueError(
+            "Resampling and SE(3) matrices cannot be used at the same time, "
+            "as correct interpolation of SE(3) values is not implemented."
+        )
+
     input_steps = [
         RenameObservationsProcessorStep(rename_map={}),
         GriffinAlphaAddBatchDimensionProcessorStep(),
+    ]
+
+    if config.relative_action_mask is not None:
+        input_steps.append(
+            RelativeActionWithSE3ProcessorStep(
+                mask=config.relative_action_mask,
+                se3_segment_start_idxs=config.se3_segment_start_idxs,
+                state_key=config.state_key,
+            )
+        )
+
+    if config.se3_segment_start_idxs:
+        input_steps.append(
+            SE3MatrixToXYZRot6DProcessorStep(
+                se3_segment_start_idxs=config.se3_segment_start_idxs,
+                state_key=config.state_key,
+            )
+        )
+
+    if config.resample_action_to_horizon:
+        input_steps.append(
+            ResampleActionProcessorStep(target_chunk_size=config.horizon),
+        )
+
+    if dataset_stats is not None:
+        norm_stats = dataset_stats
+        norm_map: dict[str, NormalizationMode] = config.normalization_mapping
+        normalizer_features = {
+            OBS_STATE: PolicyFeature(FeatureType.STATE, tuple(norm_stats[OBS_STATE]["q01"].shape))
+        }
+        input_steps.append(
+            NormalizerProcessorStep(
+                normalizer_features,
+                norm_map,
+                norm_stats,
+                normalize_observation_keys={OBS_STATE},
+            )
+        )
+
+    input_steps.extend([
         GriffinAlphaVLMInputProcessorStep.from_griffin_alpha_config(config),
         DeviceProcessorStep(device=config.device),
-    ]
+    ])
 
     output_steps = [
         DeviceProcessorStep(device="cpu"),

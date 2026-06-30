@@ -1,8 +1,14 @@
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-from lerobot.processor import DeviceProcessorStep, RenameObservationsProcessorStep
+from lerobot.processor import (
+    DeviceProcessorStep,
+    NormalizerProcessorStep,
+    ProcessorStepRegistry,
+    RenameObservationsProcessorStep,
+)
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.pipeline import DataProcessorPipeline
 from lerobot.types import TransitionKey
@@ -13,6 +19,9 @@ from lerobot_policy_griffin_alpha.processor_griffin_alpha import (
     GriffinAlphaAddBatchDimensionProcessorStep,
     GriffinAlphaImageTransform,
     GriffinAlphaVLMInputProcessorStep,
+    RelativeActionWithSE3ProcessorStep,
+    ResampleActionProcessorStep,
+    SE3MatrixToXYZRot6DProcessorStep,
     _index_optional_list,
     make_griffin_alpha_pre_post_processors,
     make_proprio_state_tokens,
@@ -114,6 +123,142 @@ class TestGriffinAlphaAddBatchDimensionProcessorStep:
         assert step.get_config() == {}
         assert step.state_dict() == {}
         step.load_state_dict({})
+
+
+class TestRelativeActionWithSE3ProcessorStep:
+    def test_real_only_subtracts_state(self):
+        step = RelativeActionWithSE3ProcessorStep(
+            mask=[True, True, True],
+            se3_segment_start_idxs=None,
+            state_key="observation.state",
+        )
+        action = torch.tensor([[[1.0, 2.0, 3.0]]])
+        state = torch.tensor([[1.0, 3.0, 1.0]])
+        transition = {
+            "action": action,
+            "observation": {"observation.state": state},
+        }
+
+        result = step(transition)
+        expected = action - state.unsqueeze(-2)
+        assert torch.equal(result["action"], expected)
+
+    def test_action_none_returns_identity(self):
+        step = RelativeActionWithSE3ProcessorStep(
+            mask=[True, True, True],
+            state_key="observation.state",
+        )
+        transition = {
+            "action": None,
+            "observation": {"observation.state": torch.tensor([[1.0, 2.0, 3.0]])},
+        }
+
+        result = step(transition)
+        assert result is transition
+
+    def test_get_config_round_trip_via_registry(self):
+        step = RelativeActionWithSE3ProcessorStep(
+            mask=[True, False, True],
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+
+        cfg = step.get_config()
+        assert isinstance(cfg["mask"], list)
+        assert isinstance(cfg["se3_segment_start_idxs"], list)
+        restored = ProcessorStepRegistry.get("griffinlabs/relative_action_with_se3_processor")(**cfg)
+
+        assert restored.mask == step.mask
+        assert torch.equal(restored._mask, torch.tensor(step.mask, dtype=torch.bool))
+        assert restored.se3_segment_start_idxs == step.se3_segment_start_idxs
+        assert restored.state_key == step.state_key
+
+
+class TestSE3MatrixToXYZRot6DProcessorStep:
+    def test_converts_action_and_state_segments(self):
+        step = SE3MatrixToXYZRot6DProcessorStep(
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+        se3_flat = torch.eye(4).reshape(1, 1, 16)
+        state = torch.eye(4).reshape(1, 16)
+        transition = {
+            "action": se3_flat.repeat(1, 2, 1),
+            "observation": {"observation.state": state},
+        }
+
+        result = step(transition)
+        assert result["action"].shape[-1] == 9
+        assert result["observation"]["observation.state"].shape[-1] == 9
+
+    def test_action_none_still_converts_state(self):
+        step = SE3MatrixToXYZRot6DProcessorStep(
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+        transition = {
+            "action": None,
+            "observation": {"observation.state": torch.eye(4).reshape(1, 16)},
+        }
+
+        result = step(transition)
+        assert result["action"] is None
+        assert result["observation"]["observation.state"].shape[-1] == 9
+
+    def test_get_config_round_trip_via_registry(self):
+        step = SE3MatrixToXYZRot6DProcessorStep(
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+        cfg = step.get_config()
+        assert isinstance(cfg["se3_segment_start_idxs"], list)
+
+        restored = ProcessorStepRegistry.get("griffinlabs/se3_mat_to_xyz_rot6d_processor")(**cfg)
+        assert restored.se3_segment_start_idxs == step.se3_segment_start_idxs
+        assert restored.state_key == step.state_key
+
+
+class TestResampleActionProcessorStep:
+    def test_divisible_chunk_subsamples(self):
+        step = ResampleActionProcessorStep(target_chunk_size=2)
+        action = torch.arange(12, dtype=torch.float32).view(1, 4, 3)
+        transition = {"action": action, "observation": {"observation.state": torch.zeros(1, 3)}}
+
+        result = step(transition)
+        expected = action[:, 1::2, :]
+        assert result["action"].shape == (1, 2, 3)
+        assert torch.equal(result["action"], expected)
+
+    def test_non_divisible_chunk_interpolates(self):
+        step = ResampleActionProcessorStep(target_chunk_size=3)
+        action = torch.arange(12, dtype=torch.float32).view(1, 4, 3)
+        transition = {"action": action, "observation": {"observation.state": torch.zeros(1, 3)}}
+
+        result = step(transition)
+        assert result["action"].shape == (1, 3, 3)
+
+    def test_equal_chunk_size_returns_unchanged(self):
+        step = ResampleActionProcessorStep(target_chunk_size=4)
+        action = torch.arange(12, dtype=torch.float32).view(1, 4, 3)
+        transition = {"action": action, "observation": {"observation.state": torch.zeros(1, 3)}}
+
+        result = step(transition)
+        assert result is transition
+
+    def test_action_none_returns_unchanged(self):
+        step = ResampleActionProcessorStep(target_chunk_size=2)
+        transition = {"action": None, "observation": {"observation.state": torch.zeros(1, 3)}}
+
+        result = step(transition)
+        assert result is transition
+
+    def test_get_config_round_trip_via_registry(self):
+        step = ResampleActionProcessorStep(target_chunk_size=2, state_key="observation.state")
+        cfg = step.get_config()
+        restored = ProcessorStepRegistry.get("griffinlabs/resample_action_processor")(**cfg)
+
+        assert restored.target_chunk_size == step.target_chunk_size
+        assert restored.state_key == step.state_key
 
 
 class TestGriffinAlphaVLMInputProcessorStep:
@@ -220,11 +365,95 @@ class TestMakeGriffinAlphaPrePostProcessors:
         assert isinstance(post, DataProcessorPipeline)
         assert pre.name == POLICY_PREPROCESSOR_DEFAULT_NAME
         assert post.name == POLICY_POSTPROCESSOR_DEFAULT_NAME
+        assert len(pre.steps) == 4
         assert isinstance(pre.steps[0], RenameObservationsProcessorStep)
         assert isinstance(pre.steps[1], GriffinAlphaAddBatchDimensionProcessorStep)
         assert isinstance(pre.steps[2], GriffinAlphaVLMInputProcessorStep)
         assert isinstance(pre.steps[3], DeviceProcessorStep)
         assert isinstance(post.steps[0], DeviceProcessorStep)
+
+    def test_relative_action_mask_inserts_step(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+    ):
+        config_with_relative = replace(griffin_alpha_config, relative_action_mask=[True] * 7)
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                pre, _ = make_griffin_alpha_pre_post_processors(config_with_relative)
+
+        assert len(pre.steps) == 5
+        assert isinstance(pre.steps[2], RelativeActionWithSE3ProcessorStep)
+        assert isinstance(pre.steps[3], GriffinAlphaVLMInputProcessorStep)
+        assert isinstance(pre.steps[4], DeviceProcessorStep)
+
+    def test_resample_action_step_inserted_before_vlm(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+    ):
+        config_with_resample = replace(griffin_alpha_config, resample_action_to_horizon=True)
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                pre, _ = make_griffin_alpha_pre_post_processors(config_with_resample)
+
+        assert isinstance(pre.steps[2], ResampleActionProcessorStep)
+        assert isinstance(pre.steps[3], GriffinAlphaVLMInputProcessorStep)
+
+    def test_resample_and_se3_enabled_raises_value_error(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+    ):
+        invalid_config = replace(
+            griffin_alpha_config,
+            se3_segment_start_idxs=[0],
+            resample_action_to_horizon=True,
+        )
+        with pytest.raises(ValueError, match="Resampling and SE\\(3\\) matrices cannot be used at the same time"):
+            make_griffin_alpha_pre_post_processors(invalid_config)
+
+    def test_dataset_stats_inserts_normalizer_before_vlm(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+    ):
+        dataset_stats = {
+            OBS_STATE: {"q01": torch.zeros(7), "q99": torch.ones(7)},
+            "action": {"q01": torch.zeros(7), "q99": torch.ones(7)},
+        }
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                pre, _ = make_griffin_alpha_pre_post_processors(
+                    griffin_alpha_config,
+                    dataset_stats=dataset_stats,
+                )
+
+        assert isinstance(pre.steps[2], NormalizerProcessorStep)
+        assert isinstance(pre.steps[3], GriffinAlphaVLMInputProcessorStep)
 
     def test_preprocessor_save_and_load_round_trip(
         self,
@@ -260,6 +489,37 @@ class TestMakeGriffinAlphaPrePostProcessors:
         assert "input_ids" in result
         assert isinstance(loaded.steps[2].image_keys, tuple)
         assert loaded.steps[2].image_keys == griffin_alpha_config.image_keys
+
+    def test_preprocessor_save_and_load_round_trip_with_relative_action_mask(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+        tmp_path,
+    ):
+        config_with_relative = replace(griffin_alpha_config, relative_action_mask=[True] * 7)
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                pre, _ = make_griffin_alpha_pre_post_processors(config_with_relative)
+                pre.save_pretrained(tmp_path)
+
+                loaded = DataProcessorPipeline.from_pretrained(
+                    tmp_path,
+                    config_filename="policy_preprocessor.json",
+                    to_transition=lambda data: data,
+                    to_output=lambda tr: tr[TransitionKey.COMPLEMENTARY_DATA],
+                )
+
+        assert isinstance(loaded.steps[2], RelativeActionWithSE3ProcessorStep)
+        assert loaded.steps[2].mask == [True] * 7
+        assert torch.equal(loaded.steps[2]._mask, torch.tensor([True] * 7, dtype=torch.bool))
 
     def test_postprocessor_save_and_load_round_trip(
         self,
