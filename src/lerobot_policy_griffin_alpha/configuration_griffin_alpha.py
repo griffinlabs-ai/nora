@@ -61,6 +61,11 @@ class GriffinAlphaConfig(PreTrainedConfig):
         "observation.images.hand_left",
         "observation.images.hand_right",
     )
+    # Policy-wide values for conditioning fields that a dataset's per-sample `info` may override.
+    # `arm_control_mode` must be resolvable from one source or the other (no silent default).
+    embodiment_prompt: str | None = None
+    arm_control_mode: str | None = None
+    predict_subtask: bool | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

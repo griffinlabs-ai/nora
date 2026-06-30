@@ -31,6 +31,32 @@ from lerobot_policy_griffin_alpha.processor_griffin_alpha import (
 from .helpers import make_sample_env_transition
 
 
+@pytest.fixture
+def vlm_step(griffin_alpha_config: GriffinAlphaConfig, fast_action_tokenizer, gemma4_vlm_processor):
+    with patch(
+        "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+        return_value=fast_action_tokenizer,
+    ):
+        with patch.object(
+            GriffinAlphaVLMInputProcessorStep,
+            "_make_vla_processor",
+            return_value=gemma4_vlm_processor,
+        ):
+            return GriffinAlphaVLMInputProcessorStep.from_griffin_alpha_config(griffin_alpha_config)
+
+
+@pytest.fixture
+def vlm_step_mocks(fast_action_tokenizer, gemma4_vlm_processor):
+    return patch(
+        "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+        return_value=fast_action_tokenizer,
+    ), patch.object(
+        GriffinAlphaVLMInputProcessorStep,
+        "_make_vla_processor",
+        return_value=gemma4_vlm_processor,
+    )
+
+
 class TestHelperFunctions:
     def test_index_optional_list_none(self):
         assert _index_optional_list(None, 0) is None
@@ -334,6 +360,15 @@ class TestGriffinAlphaVLMInputProcessorStep:
         assert "max_sequence_length" in config
         assert config["max_sequence_length"] == griffin_alpha_config.max_sequence_length
 
+    def test_get_config_includes_conditioning_fields(self, vlm_step):
+        config = vlm_step.get_config()
+        assert "embodiment_prompt" in config
+        assert "arm_control_mode" in config
+        assert "predict_subtask" in config
+        assert config["embodiment_prompt"] == vlm_step.embodiment_prompt
+        assert config["arm_control_mode"] == vlm_step.arm_control_mode
+        assert config["predict_subtask"] == vlm_step.predict_subtask
+
     def test_forwards_truncation_to_max_sequence_length(self, vlm_step, sample_env_transition):
         spy = MagicMock(wraps=vlm_step._vla_processor)
         vlm_step._vla_processor = spy
@@ -553,3 +588,64 @@ class TestMakeGriffinAlphaPrePostProcessors:
         assert isinstance(loaded.steps[0], DeviceProcessorStep)
         assert isinstance(result, torch.Tensor)
         assert result.shape == action.shape
+
+
+class TestGriffinAlphaVLMInputProcessorConditioning:
+    def _build_step(self, config, vlm_step_mocks):
+        auto_patch, vla_patch = vlm_step_mocks
+        with auto_patch, vla_patch:
+            return GriffinAlphaVLMInputProcessorStep.from_griffin_alpha_config(config)
+
+    def _run_and_get_prompt(self, step, transition):
+        spy = MagicMock(wraps=step._vla_processor)
+        step._vla_processor = spy
+        step(transition)
+        return spy.call_args.kwargs["text"][0]
+
+    def test_arm_control_mode_from_config(
+        self, griffin_alpha_config, vlm_step_mocks, sample_env_transition
+    ):
+        step = self._build_step(
+            replace(griffin_alpha_config, arm_control_mode="eef_pose"), vlm_step_mocks
+        )
+        del sample_env_transition[TransitionKey.INFO]["arm_control_mode"]
+        prompt = self._run_and_get_prompt(step, sample_env_transition)
+        assert "arm control mode: eef_pose" in prompt
+
+    def test_info_arm_control_mode_overrides_config(
+        self, griffin_alpha_config, vlm_step_mocks, sample_env_transition
+    ):
+        step = self._build_step(
+            replace(griffin_alpha_config, arm_control_mode="eef_pose"), vlm_step_mocks
+        )
+        # helper default info already sets arm_control_mode == ["joint"]
+        prompt = self._run_and_get_prompt(step, sample_env_transition)
+        assert "arm control mode: joint" in prompt
+
+    def test_arm_control_mode_missing_raises(self, vlm_step, sample_env_transition):
+        del sample_env_transition[TransitionKey.INFO]["arm_control_mode"]
+        with pytest.raises(ValueError, match="arm_control_mode must be provided"):
+            vlm_step(sample_env_transition)
+
+    def test_embodiment_prompt_from_config(
+        self, griffin_alpha_config, vlm_step_mocks, sample_env_transition
+    ):
+        step = self._build_step(
+            replace(griffin_alpha_config, embodiment_prompt="ConfigRobot"), vlm_step_mocks
+        )
+        del sample_env_transition[TransitionKey.INFO]["embodiment_prompt"]
+        prompt = self._run_and_get_prompt(step, sample_env_transition)
+        assert "embodiment: ConfigRobot" in prompt
+
+    def test_predict_subtask_from_config_true(
+        self, griffin_alpha_config, vlm_step_mocks, sample_env_transition
+    ):
+        step = self._build_step(
+            replace(griffin_alpha_config, predict_subtask=True), vlm_step_mocks
+        )
+        prompt = self._run_and_get_prompt(step, sample_env_transition)
+        assert "predict subtask: true" in prompt
+
+    def test_predict_subtask_defaults_false(self, vlm_step, sample_env_transition):
+        prompt = self._run_and_get_prompt(vlm_step, sample_env_transition)
+        assert "predict subtask: false" in prompt

@@ -376,6 +376,9 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
         "observation.images.hand_left",
         "observation.images.hand_right",
     )
+    embodiment_prompt: str | None = None
+    arm_control_mode: str | None = None
+    predict_subtask: bool | None = None
 
     def __post_init__(self) -> None:
         # JSON round-trips turn the tuple into a list; normalize so equality and
@@ -466,9 +469,18 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
 
             task = _index_optional_list(complementary_data.get("task"), i) or ""
             subtask = _index_optional_list(complementary_data.get("subtask"), i) or ""
-            predict_subtask = _index_optional_list(info.get("predict_subtask"), i) or bool(subtask)
-            embodiment = _index_optional_list(info.get("embodiment_prompt"), i) or ""
-            arm_control_mode = info["arm_control_mode"][i]
+            predict_subtask = (
+                _index_optional_list(info.get("predict_subtask"), i)
+                or self.predict_subtask
+                or bool(subtask)
+            )
+            embodiment = _index_optional_list(info.get("embodiment_prompt"), i) or self.embodiment_prompt or ""
+            arm_control_mode = _index_optional_list(info.get("arm_control_mode"), i) or self.arm_control_mode
+            if arm_control_mode is None:
+                raise ValueError(
+                    "arm_control_mode must be provided via transition info or "
+                    "GriffinAlphaConfig.arm_control_mode, but both are missing."
+                )
 
             content = [
                 {
@@ -559,6 +571,9 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
             "apply_image_augmentation": self.apply_image_augmentation,
             "apply_inference_center_crop": self.apply_inference_center_crop,
             "image_keys": self.image_keys,
+            "embodiment_prompt": self.embodiment_prompt,
+            "arm_control_mode": self.arm_control_mode,
+            "predict_subtask": self.predict_subtask,
         }
     
     @classmethod
@@ -573,6 +588,9 @@ class GriffinAlphaVLMInputProcessorStep(ProcessorStep):
             apply_image_augmentation=config.apply_image_augmentation,
             apply_inference_center_crop=config.apply_inference_center_crop,
             image_keys=config.image_keys,
+            embodiment_prompt=config.embodiment_prompt,
+            arm_control_mode=config.arm_control_mode,
+            predict_subtask=config.predict_subtask,
         )
 
 def make_griffin_alpha_pre_post_processors(
