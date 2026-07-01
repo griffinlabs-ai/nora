@@ -5,4 +5,4 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/egodex \
     --revision simplified \
-    yixuan-tan/EgoDex-LeRobot-v3.0
+    griffinlabs/EgoDex-LeRobot-v3.0

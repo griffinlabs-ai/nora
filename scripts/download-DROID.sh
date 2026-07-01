@@ -11,4 +11,4 @@ hf download \
 hf download \
     --repo-type dataset \
     --local-dir "$LOCAL_DIR" \
-    yixuan-tan/droid_1.0.1-overlay
+    griffinlabs/droid_1.0.1-griffin-alpha-overlay

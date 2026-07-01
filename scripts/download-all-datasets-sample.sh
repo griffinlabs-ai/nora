@@ -25,7 +25,7 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/interndata-a1 \
     --revision simplified \
-    yixuan-tan/InternData-A1-LeRobot-v3.0-by-embodiment \
+    griffinlabs/InternData-A1-LeRobot-v3.0-by-embodiment \
     franka-1/articulation_tasks/close_the_electriccooker/ \
     franka-2/basic_tasks/pick_the_object_into_trashcan/ \
     genie1/basic_tasks/take_shelf_items_to_cart_left_arm_part1/ \
@@ -38,6 +38,6 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/egodex \
     --revision simplified \
-    yixuan-tan/EgoDex-LeRobot-v3.0 \
+    griffinlabs/EgoDex-LeRobot-v3.0 \
     train/fry_bread/ \
     train/delta_norm_stats.json

@@ -5,4 +5,4 @@ hf download \
     --repo-type dataset \
     --local-dir ./data/interndata-a1 \
     --revision simplified \
-    yixuan-tan/InternData-A1-LeRobot-v3.0-by-embodiment
+    griffinlabs/InternData-A1-LeRobot-v3.0-by-embodiment
