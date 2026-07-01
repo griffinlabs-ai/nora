@@ -8,6 +8,7 @@ from lerobot.processor import (
     NormalizerProcessorStep,
     ProcessorStepRegistry,
     RenameObservationsProcessorStep,
+    UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import policy_action_to_transition, transition_to_policy_action
 from lerobot.processor.pipeline import DataProcessorPipeline
@@ -16,12 +17,14 @@ from lerobot.utils.constants import OBS_STATE, POLICY_POSTPROCESSOR_DEFAULT_NAME
 
 from lerobot_policy_griffin_alpha.configuration_griffin_alpha import GriffinAlphaConfig
 from lerobot_policy_griffin_alpha.processor_griffin_alpha import (
+    AbsoluteActionWithSE3ProcessorStep,
     GriffinAlphaAddBatchDimensionProcessorStep,
     GriffinAlphaImageTransform,
     GriffinAlphaVLMInputProcessorStep,
     RelativeActionWithSE3ProcessorStep,
     ResampleActionProcessorStep,
     SE3MatrixToXYZRot6DProcessorStep,
+    XYZRot6DToSE3MatrixProcessorStep,
     _index_optional_list,
     make_griffin_alpha_pre_post_processors,
     make_proprio_state_tokens,
@@ -55,6 +58,20 @@ def vlm_step_mocks(fast_action_tokenizer, gemma4_vlm_processor):
         "_make_vla_processor",
         return_value=gemma4_vlm_processor,
     )
+
+
+def _random_rotation_matrix() -> torch.Tensor:
+    q, _ = torch.linalg.qr(torch.randn(3, 3))
+    if torch.linalg.det(q) < 0:
+        q[:, 0] = -q[:, 0]
+    return q
+
+
+def _make_se3_matrix(rotation: torch.Tensor, translation: torch.Tensor) -> torch.Tensor:
+    matrix = torch.eye(4, dtype=rotation.dtype)
+    matrix[:3, :3] = rotation
+    matrix[:3, 3] = translation
+    return matrix
 
 
 class TestHelperFunctions:
@@ -240,6 +257,104 @@ class TestSE3MatrixToXYZRot6DProcessorStep:
         assert isinstance(cfg["se3_segment_start_idxs"], list)
 
         restored = ProcessorStepRegistry.get("griffinlabs/se3_mat_to_xyz_rot6d_processor")(**cfg)
+        assert restored.se3_segment_start_idxs == step.se3_segment_start_idxs
+        assert restored.state_key == step.state_key
+
+
+class TestXYZRot6DToSE3MatrixProcessorStep:
+    def test_inverts_se3_to_xyz_rot6d(self):
+        forward = SE3MatrixToXYZRot6DProcessorStep(se3_segment_start_idxs=[0], state_key="observation.state")
+        inverse = XYZRot6DToSE3MatrixProcessorStep(se3_segment_start_idxs=[0], state_key="observation.state")
+
+        identity = torch.eye(4)
+        random_rotation = _random_rotation_matrix()
+        random_translation = torch.randn(3)
+        random_se3 = _make_se3_matrix(random_rotation, random_translation)
+
+        action = torch.stack([identity.reshape(16), random_se3.reshape(16)], dim=0).unsqueeze(0)
+        state = identity.reshape(1, 16)
+        transition = {"action": action, "observation": {"observation.state": state}}
+
+        reduced = forward(transition)
+        reconstructed = inverse({"action": reduced["action"]})
+
+        assert torch.allclose(reconstructed["action"], action, atol=1e-5)
+
+    def test_get_config_round_trip_via_registry(self):
+        step = XYZRot6DToSE3MatrixProcessorStep(
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+        cfg = step.get_config()
+        restored = ProcessorStepRegistry.get("griffinlabs/xyz_rot6d_to_se3_mat_processor")(**cfg)
+
+        assert restored.se3_segment_start_idxs == step.se3_segment_start_idxs
+        assert restored.state_key == step.state_key
+
+
+class TestAbsoluteActionWithSE3ProcessorStep:
+    def test_inverts_relative_action_real_only(self):
+        state = torch.randn(1, 5)
+        absolute_action = torch.randn(1, 3, 5)
+        relative_step = RelativeActionWithSE3ProcessorStep(
+            mask=[True] * 5,
+            se3_segment_start_idxs=None,
+            state_key="observation.state",
+        )
+        relative_step({"action": None, "observation": {"observation.state": state}})
+        relative_action = relative_step(
+            {"action": absolute_action, "observation": {"observation.state": state}}
+        )["action"]
+        absolute_step = AbsoluteActionWithSE3ProcessorStep(
+            mask=[True] * 5,
+            se3_segment_start_idxs=None,
+            state_key="observation.state",
+            relative_step=relative_step,
+        )
+
+        reconstructed = absolute_step(
+            {"action": relative_action, "observation": {"observation.state": state}}
+        )["action"]
+        assert torch.allclose(reconstructed, absolute_action)
+
+    def test_inverts_relative_action_with_se3_segment(self):
+        state_se3 = _make_se3_matrix(_random_rotation_matrix(), torch.randn(3))
+        action_se3_a = _make_se3_matrix(_random_rotation_matrix(), torch.randn(3))
+        action_se3_b = _make_se3_matrix(_random_rotation_matrix(), torch.randn(3))
+        state = state_se3.reshape(1, 16)
+        absolute_action = torch.stack([action_se3_a.reshape(16), action_se3_b.reshape(16)], dim=0).unsqueeze(0)
+        relative_step = RelativeActionWithSE3ProcessorStep(
+            mask=[True] * 16,
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+        )
+        relative_step({"action": None, "observation": {"observation.state": state}})
+        relative_action = relative_step(
+            {"action": absolute_action, "observation": {"observation.state": state}}
+        )["action"]
+        absolute_step = AbsoluteActionWithSE3ProcessorStep(
+            mask=[True] * 16,
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+            relative_step=relative_step,
+        )
+
+        reconstructed = absolute_step(
+            {"action": relative_action, "observation": {"observation.state": state}}
+        )["action"]
+        assert torch.allclose(reconstructed, absolute_action, atol=1e-5)
+
+    def test_get_config_round_trip_via_registry(self):
+        step = AbsoluteActionWithSE3ProcessorStep(
+            mask=[True, False, True],
+            se3_segment_start_idxs=[0],
+            state_key="observation.state",
+            relative_step=None,
+        )
+        cfg = step.get_config()
+        restored = ProcessorStepRegistry.get("griffinlabs/absolute_action_with_se3_processor")(**cfg)
+
+        assert restored.mask == step.mask
         assert restored.se3_segment_start_idxs == step.se3_segment_start_idxs
         assert restored.state_key == step.state_key
 
@@ -430,13 +545,43 @@ class TestMakeGriffinAlphaPrePostProcessors:
         assert isinstance(pre.steps[3], GriffinAlphaVLMInputProcessorStep)
         assert isinstance(pre.steps[4], DeviceProcessorStep)
 
+    def test_relative_and_se3_link_output_inverse_steps(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+    ):
+        config_with_relative_and_se3 = replace(
+            griffin_alpha_config,
+            relative_action_mask=[True] * 16,
+            se3_segment_start_idxs=[0],
+        )
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                pre, post = make_griffin_alpha_pre_post_processors(config_with_relative_and_se3)
+
+        input_relative_step = next(
+            step for step in pre.steps if isinstance(step, RelativeActionWithSE3ProcessorStep)
+        )
+        assert isinstance(post.steps[0], XYZRot6DToSE3MatrixProcessorStep)
+        assert isinstance(post.steps[1], AbsoluteActionWithSE3ProcessorStep)
+        assert post.steps[1].relative_step is input_relative_step
+        assert isinstance(post.steps[-1], DeviceProcessorStep)
+
     def test_resample_action_step_inserted_before_vlm(
         self,
         griffin_alpha_config: GriffinAlphaConfig,
         fast_action_tokenizer,
         gemma4_vlm_processor,
     ):
-        config_with_resample = replace(griffin_alpha_config, resample_action_to_horizon=True)
+        config_with_resample = replace(griffin_alpha_config, resample_action_chunk_size=25)
         with patch(
             "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
             return_value=fast_action_tokenizer,
@@ -458,7 +603,7 @@ class TestMakeGriffinAlphaPrePostProcessors:
         invalid_config = replace(
             griffin_alpha_config,
             se3_segment_start_idxs=[0],
-            resample_action_to_horizon=True,
+            resample_action_chunk_size=25,
         )
         with pytest.raises(ValueError, match="Resampling and SE\\(3\\) matrices cannot be used at the same time"):
             make_griffin_alpha_pre_post_processors(invalid_config)
@@ -489,6 +634,33 @@ class TestMakeGriffinAlphaPrePostProcessors:
 
         assert isinstance(pre.steps[2], NormalizerProcessorStep)
         assert isinstance(pre.steps[3], GriffinAlphaVLMInputProcessorStep)
+
+    def test_dataset_stats_inserts_unnormalizer_in_postprocessor(
+        self,
+        griffin_alpha_config: GriffinAlphaConfig,
+        fast_action_tokenizer,
+        gemma4_vlm_processor,
+    ):
+        dataset_stats = {
+            OBS_STATE: {"q01": torch.zeros(7), "q99": torch.ones(7)},
+            "action": {"q01": torch.zeros(7), "q99": torch.ones(7)},
+        }
+        with patch(
+            "lerobot_policy_griffin_alpha.processor_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            with patch.object(
+                GriffinAlphaVLMInputProcessorStep,
+                "_make_vla_processor",
+                return_value=gemma4_vlm_processor,
+            ):
+                _, post = make_griffin_alpha_pre_post_processors(
+                    griffin_alpha_config,
+                    dataset_stats=dataset_stats,
+                )
+
+        assert any(isinstance(step, UnnormalizerProcessorStep) for step in post.steps)
+        assert isinstance(post.steps[-1], DeviceProcessorStep)
 
     def test_preprocessor_save_and_load_round_trip(
         self,

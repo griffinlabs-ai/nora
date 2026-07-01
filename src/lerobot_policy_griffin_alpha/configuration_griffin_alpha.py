@@ -76,7 +76,7 @@ class GriffinAlphaConfig(PreTrainedConfig):
     )
     relative_action_mask: list[bool] | None = None
     se3_segment_start_idxs: list[int] | None = None
-    resample_action_to_horizon: bool = False
+    resample_action_chunk_size: int | None = None
     state_key: str = OBS_STATE
 
     optimizer_lr: float = 3e-5

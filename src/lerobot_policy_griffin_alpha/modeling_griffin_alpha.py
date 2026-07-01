@@ -10,6 +10,7 @@ from transformers import AutoConfig, AutoProcessor, GenerationConfig, Gemma4ForC
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from .configuration_griffin_alpha import GriffinAlphaConfig
+from .processor_griffin_alpha import ResampleActionProcessorStep
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,11 @@ class GriffinAlphaPolicy(PreTrainedPolicy):
         )
         self.fast_tokenizer.action_dim = config.max_action_dim
         self.fast_tokenizer.time_horizon = config.horizon
+        self._action_resampler = (
+            ResampleActionProcessorStep(target_chunk_size=config.resample_action_chunk_size)
+            if config.resample_action_chunk_size
+            else None
+        )
         self.reset()
 
     def reset(self) -> None:
@@ -131,7 +137,10 @@ class GriffinAlphaPolicy(PreTrainedPolicy):
         model_inputs = self._filter_model_inputs(batch)
         model_inputs.pop("labels", None)
         generated_ids = self.model.generate(**model_inputs)
-        return self._decode_action_tokens(generated_ids, batch.get("n_action_dims"))
+        chunk = self._decode_action_tokens(generated_ids, batch.get("n_action_dims"))
+        if self._action_resampler is not None:
+            chunk = self._action_resampler({"action": chunk})["action"]
+        return chunk
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor], **kwargs) -> Tensor:

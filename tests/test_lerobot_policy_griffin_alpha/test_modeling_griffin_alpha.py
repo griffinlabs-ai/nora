@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -118,6 +119,28 @@ class TestGriffinAlphaPolicy:
         assert griffin_alpha_policy.predict_action_chunk.call_count == 1
         for action in actions:
             assert action.shape == (1, action_dim)
+
+    def test_predict_action_chunk_resamples_to_native_chunk_size(
+        self,
+        griffin_alpha_config,
+        tiny_gemma4_model,
+        fast_action_tokenizer,
+    ):
+        native_chunk_size = griffin_alpha_config.horizon + 2
+        config = replace(griffin_alpha_config, resample_action_chunk_size=native_chunk_size)
+        with patch(
+            "lerobot_policy_griffin_alpha.modeling_griffin_alpha.AutoProcessor.from_pretrained",
+            return_value=fast_action_tokenizer,
+        ):
+            policy = GriffinAlphaPolicy(config, gemma4_model=tiny_gemma4_model)
+
+        action_dim = policy.config.max_action_dim
+        decoded_chunk = torch.randn(1, policy.config.horizon, action_dim)
+        with patch.object(policy.model, "generate", return_value=torch.tensor([[1, 2, 3]])):
+            with patch.object(policy, "_decode_action_tokens", return_value=decoded_chunk):
+                chunk = policy.predict_action_chunk({"input_ids": torch.tensor([[1]])})
+
+        assert chunk.shape == (1, native_chunk_size, action_dim)
 
     def test_save_and_load_round_trip(
         self, griffin_alpha_config, tiny_gemma4_model, fast_action_tokenizer, tmp_path
